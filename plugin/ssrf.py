@@ -13,8 +13,8 @@ Public surface (consumed by P1.3 callsites in tools.py / friends.py):
     PinnedTarget, SSRFBlocked, UnconfiguredURL,
     DNSResolutionFailed, RedirectBlocked
 
-Implements design doc `docs/drafts/issue3-ssrf-design.md` §3.1-§3.5
-(P1.1 LOCKED 2026-05-02). No callsite wiring here; that is P1.3.
+Implements the public-preview SSRF policy. Callsite wiring lives in the A2A
+tool and friend-management paths.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ class PinnedTarget:
     `canonical_url` is the URL that callsites MUST hand to opener.open().
     It is the post-IDNA, userinfo-stripped, fragment-stripped form of the
     input URL — passing the original URL to opener.open() can desync
-    SNI/Host from the validated host (Codex P2.7).
+    SNI/Host from the validated host.
     """
 
     hostname: str
@@ -95,8 +95,7 @@ def _is_dev_env() -> bool:
 def is_env_private_allowed() -> bool:
     """True iff A2A_ALLOW_PRIVATE_NETWORKS is set AND the dev gate is satisfied.
 
-    Per Codex P1.4 closure: the env var is a dev/test escape hatch only;
-    production cannot enable it.
+    The env var is a dev/test escape hatch only; production cannot enable it.
     """
     if os.getenv(_PRIVATE_NETWORK_ENV, "").lower() not in _TRUE_VALUES:
         return False
@@ -145,7 +144,7 @@ def _build_canonical_url(
     path: str,
     query: str,
 ) -> str:
-    """Codex P2.7: opener-ready URL form.
+    """Return an opener-ready URL form.
 
     `scheme://host[:port]/path[?query]`. IPv6 hosts bracketed; default
     ports (80/443) elided; userinfo and fragment never present (validator
@@ -322,9 +321,10 @@ def validate_outbound_url(
         )
 
     # Step 3: hostname path — explicit `allow_private=True` is IP-literal-only
-    # (Codex P2.4). The dev/test env gate is the only path through which a
-    # hostname is permitted to resolve to a private address, and even then
-    # only because the operator has owned that risk via env vars.
+    # (per-friend approvals only apply to IP literals). The dev/test env gate
+    # is the only path through which a hostname is permitted to resolve to a
+    # private address, and even then only because the operator has owned that
+    # risk via env vars.
     if allow_private:
         raise SSRFBlocked(
             f"allow_private=True is only valid for IP-literal hosts; got hostname {raw_host!r}"
@@ -337,7 +337,7 @@ def validate_outbound_url(
         # Per D9: IDNA failure → SSRFBlocked (cannot meaningfully validate)
         raise SSRFBlocked(f"IDNA encoding failed for {raw_host!r}: {e}") from e
 
-    # Step 5: unconfigured guard BEFORE DNS (Codex P2.6) — refusing to even
+    # Step 5: unconfigured guard BEFORE DNS — refusing to even
     # resolve unconfigured hostnames closes the DNS-egress side channel that
     # would otherwise leak attacker-supplied lookups.
     if not allow_unconfigured and not is_configured_friend:
@@ -530,7 +530,7 @@ def build_ssrf_opener(
     """Build a urllib opener wired with:
 
     - `ProxyHandler({})` — disables HTTPS_PROXY / HTTP_PROXY / NO_PROXY env-var
-      proxy resolution (Codex P1.3). Without this the default opener would route
+      proxy resolution. Without this the default opener would route
       through `urllib.request.ProxyHandler`, which constructs its own
       HTTPConnection from the proxy URL and bypasses our pinned-IP subclass.
     - `_PinnedHTTPSHandler` / `_PinnedHTTPHandler` carrying `target.pinned_ip`.

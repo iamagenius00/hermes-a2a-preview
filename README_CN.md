@@ -99,10 +99,14 @@ M2 仍然是保守预览：
 安装前：
 
 - 使用 Hermes Agent v2026.4.23+。
+- 先完成 `hermes setup`，确保 `~/.hermes/config.yaml` 已存在。
+- 先启动一次 Hermes，并从你的主聊天里发过一条消息。installer 会用这个
+  session metadata 把 A2A wakeup 路由回同一个对话。
 - 确认你本机可以运行 `hermes gateway restart`，或者知道 Hermes 可执行文件的
   完整路径。
 - 如果这是已有 Hermes 安装，先备份 `~/.hermes/.env` 和
   `~/.hermes/config.yaml`。
+
 安装并重启：
 
 ```bash
@@ -153,6 +157,33 @@ A2A_PORT=8081
 # 即时唤醒：
 # A2A_WEBHOOK_SECRET=***
 ```
+
+如果自动配置 webhook 失败，在 `~/.hermes/config.yaml` 里手动加入：
+
+```yaml
+webhook:
+  extra:
+    routes:
+      a2a_trigger:
+        secret: "<generate-a-random-secret>"  # 必须匹配 A2A_WEBHOOK_SECRET
+        deliver: telegram  # 或 discord、slack 等
+        deliver_extra:
+          chat_id: '<your-chat-id>'
+        prompt: '[A2A trigger]'
+        source:
+          platform: telegram
+          chat_type: dm
+          chat_id: '<your-chat-id>'
+          user_id: '<your-user-id>'
+          user_name: '<your-name>'
+```
+
+installer 能推断主聊天 session 时，会同时写入 `webhook.extra.routes` 和
+`platforms.webhook.extra.routes`。
+
+`source` block 很关键：它把 A2A 消息路由进你的**主聊天 session**，而不是创建
+一次性的 webhook session。`deliver` 和 `deliver_extra` 则保证 agent 的回复能
+发回你的聊天窗口。
 
 重启：
 
@@ -260,7 +291,7 @@ curl -X POST https://remote-agent \
 
 | 层 | 做什么 |
 |----|--------|
-| 认证 | Bearer token。没 token 时只允许 localhost。`hmac.compare_digest()` 常量时间比较 |
+| 认证 | per-friend Bearer token。没有匹配 friend token 的请求默认拒绝；localhost trust 只在显式 dev 配置下启用。`hmac.compare_digest()` 常量时间比较 |
 | Friends | per-friend inbound token hash、outbound token、status、trust、rate limit |
 | 速率限制 | 每 IP 每分钟 20 次，线程安全 |
 | 入站过滤 | 9 种 prompt injection 模式（含 ChatML、role 前缀、override 变体） |
@@ -315,25 +346,11 @@ curl -X POST https://remote-agent \
 
 ## 从 v1 升级
 
-如果之前用的是 gateway patch：
+这个 preview 不需要 patch Hermes 源码。这个版本不要再应用旧的 gateway patch。
 
-1. 还原 patch：`cd ~/.hermes/hermes-agent && git checkout -- gateway/ hermes_cli/ pyproject.toml`
-2. 跑 `./install.sh`
-3. 完事。v2 涵盖 v1 全部功能，多了即时唤醒和对话持久化
-
-<details>
-<summary>v1 安装说明（旧方案，不再推荐）</summary>
-
-原来的方案 patch Hermes gateway 源码，把 A2A 注册为平台适配器：
-
-```bash
-cd ~/.hermes/hermes-agent
-git apply /path/to/hermes-a2a/patches/hermes-a2a.patch
-```
-
-修改 `gateway/config.py`、`gateway/run.py`、`hermes_cli/tools_config.py` 和 `pyproject.toml`。需要 `aiohttp`。
-
-</details>
+如果你之前装过 gateway-patch 版本，先还原 Hermes Agent checkout，再运行
+`./install.sh`。当前 plugin install 覆盖同一组 A2A 能力，并带有即时唤醒和对话
+持久化。
 
 ## 已知限制
 

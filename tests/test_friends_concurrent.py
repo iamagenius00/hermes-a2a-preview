@@ -1,6 +1,6 @@
 """Tests for cross-process concurrency safety in plugin/friends.py.
 
-Issue 4 Patch 1 (post-codex P1.1 + P1.2):
+Issue 4 Patch 1:
 - ``fcntl.flock``-based cross-process lock around read-modify-write
 - ``tempfile.mkstemp`` for unique tmp files (no .tmp collisions)
 
@@ -240,7 +240,7 @@ def test_sweep_old_orphan_tmp_on_init(tmp_path):
 
 
 def test_init_sweep_skipped_when_writer_holds_lock(tmp_path):
-    """Codex P2.1: sweep must NOT delete the active writer's tmp.
+    """Sweep must NOT delete the active writer's tmp.
 
     Hold the file lock from the test process, then have a child process
     try to init a FriendsStore (which runs sweep). The sweep must NOT
@@ -299,7 +299,7 @@ def test_concurrent_rotate_no_lost_state(tmp_path):
     land — pause persists AND rotate produces a new token that
     invalidates the old one.
 
-    Codex P2.3 strengthening: previous version only checked
+    Regression coverage: the previous version only checked
     ``inbound_token_hash starts with "sha256:"``, which was true even if
     rotate did nothing. This version captures the OLD raw token (from
     seed) and the NEW raw token (from rotate subprocess stdout) and
@@ -355,7 +355,7 @@ def test_concurrent_rotate_no_lost_state(tmp_path):
     )
 
 
-# ── more state-machine combos under concurrency (Codex P2.4) ───────────
+# ── more state-machine combos under concurrency ────────────────────────
 
 
 def test_concurrent_add_and_remove_state_machine(tmp_path):

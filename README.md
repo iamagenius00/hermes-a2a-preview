@@ -99,10 +99,14 @@ M2 is still intentionally conservative:
 Before installing:
 
 - Use Hermes Agent v2026.4.23+.
+- Complete `hermes setup` first so `~/.hermes/config.yaml` exists.
+- Start Hermes once and send a message from your main chat. The installer uses
+  that session metadata to route A2A wakeups back into the same conversation.
 - Make sure `hermes gateway restart` works on your machine, or know the full
   path to your Hermes executable.
 - If this is an existing Hermes install, keep a copy of `~/.hermes/.env` and
   `~/.hermes/config.yaml` before testing.
+
 Install and restart:
 
 ```bash
@@ -159,20 +163,24 @@ Add webhook route to `~/.hermes/config.yaml`:
 
 ```yaml
 webhook:
-  routes:
-    a2a_trigger:
-      secret: "<generate-a-random-secret>"  # must match A2A_WEBHOOK_SECRET
-      deliver: telegram  # or discord, slack, etc.
-      deliver_extra:
-        chat_id: '<your-chat-id>'
-      prompt: '[A2A trigger]'
-      source:
-        platform: telegram
-        chat_type: dm
-        chat_id: '<your-chat-id>'
-        user_id: '<your-user-id>'
-        user_name: '<your-name>'
+  extra:
+    routes:
+      a2a_trigger:
+        secret: "<generate-a-random-secret>"  # must match A2A_WEBHOOK_SECRET
+        deliver: telegram  # or discord, slack, etc.
+        deliver_extra:
+          chat_id: '<your-chat-id>'
+        prompt: '[A2A trigger]'
+        source:
+          platform: telegram
+          chat_type: dm
+          chat_id: '<your-chat-id>'
+          user_id: '<your-user-id>'
+          user_name: '<your-name>'
 ```
+
+The installer writes both `webhook.extra.routes` and
+`platforms.webhook.extra.routes` when it can infer the main chat session.
 
 The `source` block is critical — it routes A2A messages into your **main chat session** instead of creating throwaway webhook sessions. Without it, the agent spawns an isolated session per message and loses all conversation context.
 
@@ -287,7 +295,7 @@ Privacy isn't a checkbox — it was earned through real leaks. The first version
 
 | Layer | What it does |
 |-------|-------------|
-| Auth | Bearer token. Localhost-only without token. `hmac.compare_digest()` constant-time comparison |
+| Auth | Per-friend Bearer tokens. Requests without a matching friend token are rejected by default; localhost trust is only available through explicit dev configuration. `hmac.compare_digest()` constant-time comparison |
 | Friends | Per-friend inbound token hashes, outbound tokens, status, trust, and rate limits |
 | Rate limit | 20 req/min per IP, thread-safe |
 | Inbound filtering | 9 prompt injection patterns (ChatML, role prefixes, override variants) |
@@ -345,25 +353,12 @@ A corresponding [PR #11025](https://github.com/NousResearch/hermes-agent/pull/11
 
 ## Upgrade from v1
 
-If you were using the gateway patch:
+This preview does not require patching Hermes source code. Do not apply legacy
+gateway patches for this release.
 
-1. Revert: `cd ~/.hermes/hermes-agent && git checkout -- gateway/ hermes_cli/ pyproject.toml`
-2. Run `./install.sh`
-3. Done. v2 covers everything v1 did, plus instant wake and conversation persistence
-
-<details>
-<summary>v1 install instructions (legacy, no longer recommended)</summary>
-
-The original approach patched Hermes gateway source to register A2A as a platform adapter:
-
-```bash
-cd ~/.hermes/hermes-agent
-git apply /path/to/hermes-a2a/patches/hermes-a2a.patch
-```
-
-Modifies `gateway/config.py`, `gateway/run.py`, `hermes_cli/tools_config.py`, and `pyproject.toml`. Requires `aiohttp`.
-
-</details>
+If you previously used a gateway-patch install, restore your Hermes Agent
+checkout first, then run `./install.sh`. The current plugin install covers the
+same A2A surface with instant wake and conversation persistence.
 
 ## Known limitations
 
