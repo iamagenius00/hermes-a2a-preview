@@ -110,8 +110,8 @@ Before installing:
 Install and restart:
 
 ```bash
-git clone https://github.com/iamagenius00/hermes-a2a-m1-m2.git
-cd hermes-a2a-m1-m2
+git clone https://github.com/iamagenius00/hermes-a2a-preview.git
+cd hermes-a2a-preview
 ./install.sh
 hermes gateway restart
 ```
@@ -138,8 +138,8 @@ stored in the friends file, audit log, or gateway logs.
 ## Install
 
 ```bash
-git clone https://github.com/iamagenius00/hermes-a2a-m1-m2.git
-cd hermes-a2a-m1-m2
+git clone https://github.com/iamagenius00/hermes-a2a-preview.git
+cd hermes-a2a-preview
 ./install.sh
 ```
 

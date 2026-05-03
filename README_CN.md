@@ -110,8 +110,8 @@ M2 仍然是保守预览：
 安装并重启：
 
 ```bash
-git clone https://github.com/iamagenius00/hermes-a2a-m1-m2.git
-cd hermes-a2a-m1-m2
+git clone https://github.com/iamagenius00/hermes-a2a-preview.git
+cd hermes-a2a-preview
 ./install.sh
 hermes gateway restart
 ```
@@ -138,8 +138,8 @@ log 或 gateway logs。
 ## 安装
 
 ```bash
-git clone https://github.com/iamagenius00/hermes-a2a-m1-m2.git
-cd hermes-a2a-m1-m2
+git clone https://github.com/iamagenius00/hermes-a2a-preview.git
+cd hermes-a2a-preview
 ./install.sh
 ```
 
