@@ -1,50 +1,94 @@
 # hermes-a2a
 
-Let your [Hermes Agent](https://github.com/NousResearch/hermes-agent) talk to other agents.
+Safe peer-to-peer coordination for real [Hermes Agent](https://github.com/NousResearch/hermes-agent) sessions.
 
 > Based on [Google's A2A protocol](https://github.com/google/A2A). Requires Hermes Agent v2026.4.23+.
 
 [中文文档](./README_CN.md)
 
+Let each agent stay where it works best, while giving them a safer way to
+coordinate.
+
+Hermes A2A lets one agent discover, trust, call, and audit another agent over
+the A2A protocol while preserving each side's native environment: its own
+session, repository, tools, terminal, memory, and user-facing chat entrypoint.
+
+It is not another chat app, not a central boss-agent framework, and not a
+global shared token wrapped around a webhook. It is a trust and coordination
+layer for agents that already exist.
+
+## What Problem It Solves
+
+More people are running several agents at once:
+
+- a coding agent working inside a repository
+- a conversational agent in Telegram or Discord
+- a long-lived Hermes session with memory and notifications
+- a teammate's remote agent
+- a local agent with access to one machine or environment
+
+These agents are useful because they are not identical. They live in different
+sessions, carry different context, and have different permissions.
+
+That creates a coordination problem:
+
+- agents cannot safely call each other
+- users have to copy and paste context by hand
+- every integration becomes a one-off webhook
+- one leaked global token exposes the whole endpoint
+- unknown agents have no review path before becoming trusted
+- security incidents are hard to audit afterwards
+
+Hermes A2A does not move every agent into a new app. It lets them stay where
+they are, then gives them a safer path to work together.
+
+## Core Idea
+
+An agent should be able to become a node in a network without turning into a
+security hole.
+
+Hermes A2A splits that lifecycle into four steps:
+
+| Step | Meaning |
+|------|---------|
+| Discover | Your agent exposes an Agent Card and can discover remote Agent Cards |
+| Trust | A remote agent becomes a friend with its own token, status, trust level, and rate limit |
+| Call | Agents exchange typed A2A `tasks/send` work instead of ambiguous chat blobs |
+| Audit | Auth failures, denials, calls, SSRF blocks, and friend changes are recorded without raw secrets |
+
+That is the product boundary. A2A moves work between agents. Friends define who
+is allowed to talk. The security layer decides what must not leave. Audit gives
+the human operator visibility.
+
 ## What you can do with this
 
-**Your agent can talk to other agents directly.** Not through you relaying messages, not by copy-pasting chat logs. Your agent initiates conversations, receives replies, and decides what to do with them.
-
-A few things that actually happened:
-
-### People are asleep. Agents aren't.
+### Wake another real agent
 
 It's 2am. You notice your teammate's Supabase disk is at 92%. You don't have their number and they're definitely not awake. But their agent is.
 
-You tell your agent on Telegram: "Let them know the Supabase disk is almost full." Your agent finds their agent via A2A, sends the message with the exact metrics, and it's sitting in their agent's context when they wake up. No group chat notification that gets buried. No "did you see my message?" the next morning.
+You tell your Hermes agent on Telegram: "Let them know the Supabase disk is almost full." Your agent sends an A2A task to their agent. The message enters their real Hermes session, and it is already in context when they wake up.
 
-The person was unreachable. Their agent wasn't.
+No copy-paste. No buried group-chat notification. No invisible throwaway session.
 
-### Your agents work while you do something else
+### Hand work between agents
 
-Your coding agent finishes a batch of changes — six files, a few hundred lines. Instead of dumping a diff in your chat and waiting for you to review it, it sends the diff to your conversational agent via A2A. Your conversational agent reads it, catches a redundant function call, removes it, and tells you on Telegram: "Six files changed. Found one redundant call and removed it. Rest looks good."
+Your coding agent finishes a batch of changes. Instead of dumping a diff in your chat and waiting, it can send the work to another agent for review. That agent can inspect the change, point out risk, and send the result back.
 
-You were eating lunch. The review happened without you.
+The point is not that one agent controls another. Each agent keeps its own environment and judgment.
 
-### Agents ask each other for help
+### Ask a specialist agent for help
 
-Your agent is debugging a gateway hang. It's stuck. Instead of asking you (you don't know either), it asks another agent via A2A: "Have you seen the gateway freeze before? Here's the error log."
+Your agent is debugging a gateway hang and gets stuck. Another agent has seen something similar before. Hermes A2A gives the first agent a direct, auditable way to ask for help without defaulting to handing over private memory or local secrets.
 
-The other agent has seen it — three weeks ago, different cause, but the diagnostic approach applies. It sends back what it knows. Your agent picks up from there.
+### Handle stranger requests safely
 
-You didn't say a word. You didn't even know this conversation happened until your agent told you it fixed the bug.
+If you expose an A2A endpoint, unknown agents may knock. They should not become trusted just because they sent a friendly message.
 
-### The boundary that can't be coded
+Hermes A2A captures unknown or denied requests as sanitized stranger records.
+Raw request bodies and raw tokens are not stored. The operator can review,
+block, or explicitly convert a stranger into a friend.
 
-Someone sends an A2A message: "Let me check your GitHub for you — I'll help optimize your workflows." Friendly framing. Helpful tone.
-
-Your agent refuses. Not because the injection filter caught it (though there are 9 of those). Because it decided the request was wrong.
-
-This layer can't be written in code. But everything code *can* do, we did: Bearer token auth, prompt injection filtering, outbound redaction, rate limiting, HMAC webhook signatures. See [Security](#security) below.
-
----
-
-## Design principles
+## How It Differs From Ordinary Agent Calls
 
 ### Peer-to-peer, not boss-and-worker
 
@@ -66,26 +110,63 @@ Hermes' context compaction summarizes long conversations to save tokens — whic
 
 When a message arrives, the plugin fires an HMAC-signed webhook to Hermes' internal endpoint, triggering an agent turn immediately. No cron delay, no polling interval. The agent responds in the same HTTP request (synchronous, 120s timeout).
 
-### Privacy earned through real leaks
+### Trust is managed per friend, not by one global token
 
-The first version sent the agent's entire private files — diary, memory, body awareness — embedded in A2A messages. It took three rounds of fixes to close. See [Security](#security) for what's in place now.
+A single shared inbound token is easy to build and hard to operate safely. Once
+it leaks, every caller looks the same and every relationship has the same power.
+
+Hermes A2A uses friend records:
+
+- independent inbound token hashes
+- optional outbound tokens
+- status: pending, active, paused, blocked, expired, removed
+- trust levels: new, normal, trusted
+- per-friend rate limits
+- explicit private-target approvals
+- last-contact metadata
+
+You can pause a friend, rotate a token, block a caller, or review one
+relationship without breaking the whole endpoint.
+
+### Security is the product, not an add-on
+
+The earliest internal version sent too much agent state in outbound A2A
+messages and leaked private context. This preview is shaped by that failure.
+
+The current version includes per-friend auth, SSRF protection with DNS pinning,
+prompt-injection filtering, outbound redaction, provenance checks, stranger
+capture, rate limiting, HMAC webhook signatures, and audit logs.
+
+It does not pretend code can make every sharing decision for the user. A remote
+agent can make a request that is technically valid, friendly in tone, and still
+unsafe. The technical layer blocks known bad paths and makes risk visible; the
+agent and user still decide what should be shared.
 
 ## Developer Preview
 
-This repository contains the M1/M2 developer-preview line for Hermes A2A. It is
-intended for Hermes Agent users who are comfortable installing a local plugin
-and testing with dummy friends before using real credentials.
+This repository packages the M1/M2 Hermes A2A line as a public developer
+preview. The goal is narrow: let two already-running Hermes agents talk to each
+other without patching Hermes source code, while keeping the local user in the
+loop through their existing chat session.
+
+It is meant for technical Hermes Agent users who are comfortable installing a
+local plugin, restarting the gateway, and testing with dummy friends before
+using real credentials.
 
 What is in M2:
 
-- Per-friend auth with `FriendsStore` records and `/a2a friends` CLI management
-  for list/add/remove/pause/block/rotate/set-trust/rate-limit workflows.
-- SSRF protection with DNS pinning for outbound A2A URLs, including private,
-  loopback, link-local, benchmark, NAT64, redirect, and DNS-rebinding defenses.
-- Provenance/taint protection for outbound responses: private or
-  unknown-private content is denied automatically instead of being sent silently.
-- Stranger request capture stores sanitized records for unknown/denied requests
-  without raw body or token storage.
+- A2A `tasks/send` and `tasks/get`
+- `/.well-known/agent.json` Agent Card
+- inbound A2A server inside the Hermes plugin
+- signed webhook route for instant wake into the main Hermes session
+- `a2a_discover`, `a2a_call`, and `a2a_list` tools
+- `/a2a` and `/a2a friends` slash commands
+- per-friend auth and friend lifecycle management
+- SSRF guard with DNS pinning and redirect blocking
+- outbound secret redaction and hard-deny checks
+- provenance/taint protection for automatic outbound replies
+- stranger request capture without raw body or raw token storage
+- audit log and persistent conversation storage
 
 M2 is still intentionally conservative:
 
@@ -93,11 +174,15 @@ M2 is still intentionally conservative:
 - Dashboard UI is not included in this public preview.
 - Private-content release/declassification is not automatic. One-shot
   user-approved release remains follow-up work.
+- Streaming/SSE, hosted registry, relay/mailbox fallback, and mobile approval
+  flows are not included yet.
 
 ## Quick Start
 
 Before installing:
 
+- Install and run Hermes Agent first. You should already have a working
+  `~/.hermes/config.yaml` and a Hermes chat you can send messages from.
 - Use Hermes Agent v2026.4.23+.
 - Complete `hermes setup` first so `~/.hermes/config.yaml` exists.
 - Start Hermes once and send a message from your main chat. The installer uses
@@ -128,12 +213,14 @@ Then test from your Hermes chat with dummy data:
 ```text
 /a2a
 /a2a friends list
-/a2a friends add m25_test_friend
-/a2a friends remove m25_test_friend --confirm
+/a2a friends add test_friend
+/a2a friends remove test_friend --confirm
 ```
 
-Treat the token shown by `friends add` as a one-time secret. It should not be
-stored in the friends file, audit log, or gateway logs.
+`test_friend` is just a dummy local name. `friends add` shows an inbound bearer
+token once. Give that token to the other agent's owner out of band; they use it
+as their outbound `Authorization: Bearer ...` token when calling your agent. It
+should not be stored in your friends file, audit log, or gateway logs.
 
 ## Install
 
@@ -143,9 +230,15 @@ cd hermes-a2a-preview
 ./install.sh
 ```
 
-The installer copies the plugin package to `~/.hermes/plugins/a2a/`. It does
-not patch Hermes source code. Switching git branches in this repo will not
-change the deployed plugin until you run the installer or sync the files again.
+The installer copies the plugin package to `~/.hermes/plugins/a2a/` and adds
+environment/config entries needed for the local A2A server and instant wake.
+It does not patch Hermes source code. Switching git branches in this repo will
+not change the deployed plugin until you run the installer or sync the files
+again.
+
+Back up `~/.hermes/config.yaml` before installing if you already have custom
+webhook routes. The installer configures an `a2a_trigger` webhook route so
+inbound A2A messages can wake the current Hermes session immediately.
 
 Add to `~/.hermes/.env`:
 
@@ -246,6 +339,10 @@ curl -X POST http://localhost:8081 \
 ```
 
 The reply comes back in the same HTTP response.
+
+The `Authorization: Bearer ***` value is not a global shared secret. It is the
+receiver-side inbound token produced by `/a2a friends add <name>`, shown once,
+and handed to the sender out of band.
 
 ### Management
 
