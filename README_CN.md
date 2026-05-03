@@ -184,6 +184,8 @@ M2 仍然是保守预览：
   `~/.hermes/config.yaml`，也能从自己的 Hermes 主聊天里发消息。
 - 使用 Hermes Agent v2026.4.23+。
 - 先完成 `hermes setup`，确保 `~/.hermes/config.yaml` 已存在。
+- 如果 `~/.hermes/config.yaml` 不存在，`./install.sh` 会在复制 plugin、写 `.env`
+  或生成 secret 之前直接退出。
 - 先启动一次 Hermes，并从你的主聊天里发过一条消息。installer 会用这个
   session metadata 把 A2A wakeup 路由回同一个对话。
 - 确认你本机可以运行 `hermes gateway restart`，或者知道 Hermes 可执行文件的
@@ -207,6 +209,9 @@ curl http://127.0.0.1:8081/health
 curl http://127.0.0.1:8081/.well-known/agent.json
 ```
 
+这是本地 smoke test。真实 A2A 使用需要第二个 Hermes instance，或一个能访问你
+A2A endpoint 的 friend agent。
+
 然后在 Hermes chat 里用 dummy 数据测试：
 
 ```text
@@ -229,12 +234,18 @@ cd hermes-a2a-preview
 ./install.sh
 ```
 
-安装脚本会把 plugin package 复制到 `~/.hermes/plugins/a2a/`，并写入本地 A2A
-server 和 instant wake 需要的 env/config。它不 patch Hermes 源码。切换这个
-repo 的 git 分支不会自动改变已部署插件；需要重新运行 installer 或重新同步文件。
+安装脚本会先检查 Hermes config，再把 plugin package 复制到
+`~/.hermes/plugins/a2a/`，并写入本地 A2A server 和 instant wake 需要的
+env/config。重复安装会先备份已部署 plugin，再替换。它不 patch Hermes 源码。
+切换这个 repo 的 git 分支不会自动改变已部署插件；需要重新运行 installer 或重新
+同步文件。
 
 如果你已有自定义 webhook route，安装前先备份 `~/.hermes/config.yaml`。installer
 会配置 `a2a_trigger` webhook route，让入站 A2A 消息能立刻唤醒当前 Hermes session。
+
+installer 会把 `~/.hermes/.env` 设为 mode 600，因为其中可能包含
+`A2A_WEBHOOK_SECRET`。如果你有意让另一个 OS 用户或 service account 运行 Hermes，
+请明确调整 ownership 和权限。
 
 在 `~/.hermes/.env` 里加：
 
@@ -304,6 +315,15 @@ hermes gateway restart
 Hermes。friends、audit、conversation 等 runtime data 在 `~/.hermes/a2a_*`，
 上面的 installer rollback 步骤不会删除这些数据。
 
+### 卸载
+
+`./uninstall.sh` 会移动已部署 plugin，备份 `.env` 和 `config.yaml`，删除 installer
+管理的 `A2A_*` env 行，把 `WEBHOOK_ENABLED` 注释出来供你确认，并在 PyYAML 可用时
+从两个 webhook route 位置移除 `a2a_trigger`。
+
+friends、audit log、conversation、stranger record 等 runtime data 不会自动删除。
+如果你确实想清掉本地 A2A 历史，请先检查 `~/.hermes/a2a_*`，再手动删除。
+
 ## 使用
 
 ### 接收消息
@@ -332,9 +352,10 @@ curl -X POST http://localhost:8081 \
 
 回复在同一个 HTTP 响应里返回。
 
-`Authorization: Bearer ***` 不是全局共享 secret。它是接收方通过
-`/a2a friends add <name>` 生成的一次性展示 inbound token，再通过 A2A 之外的渠道
-交给发送方。
+`Authorization: Bearer ***` 的 `***` 是接收方通过
+`/a2a friends add <sender-name>` 生成的接收方 inbound token。它只显示一次，应该
+通过 A2A 之外的渠道交给发送方。它不是 `A2A_WEBHOOK_SECRET`，新安装也不应该使用
+legacy `A2A_AUTH_TOKEN` 模型。
 
 ### 管理
 

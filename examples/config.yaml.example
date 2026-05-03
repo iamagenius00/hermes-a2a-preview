@@ -6,12 +6,15 @@ a2a:
     - name: "friend"
       url: "http://friend-address:8081"
       description: "My friend's agent"
-      auth_token: ""  # optional outbound token your friend gave you
+      # Outbound bearer token your friend generated for you with:
+      #   /a2a friends add <your-name>
+      # This is their inbound token for your calls to their agent.
+      auth_token: "<outbound-token-from-friend>"
 
     - name: "colleague"
       url: "http://colleague-address:8081"
       description: "My colleague's agent"
-      auth_token: "shared-secret"
+      auth_token: "<outbound-token-from-friend>"
 
 # Inbound auth for new installs is per-friend.
 # Add friends with:
