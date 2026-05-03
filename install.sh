@@ -132,21 +132,20 @@ if grep -q "a2a_trigger:" "$CONFIG_FILE" 2>/dev/null; then
     echo "✓ a2a_trigger route already in config.yaml (not overwriting)"
 else
     # We need to add the route. Use python for safe YAML manipulation.
-    A2A_INSTALL_CONFIG_FILE="$CONFIG_FILE" \
-    A2A_INSTALL_SECRET="$A2A_SECRET" \
-    A2A_INSTALL_HOME_PLATFORM="$HOME_PLATFORM" \
-    A2A_INSTALL_HOME_CHAT_ID="$HOME_CHAT_ID" \
-    A2A_INSTALL_HOME_USER_ID="$HOME_USER_ID" \
-    A2A_INSTALL_HOME_USER_NAME="$HOME_USER_NAME" \
-    python3 <<'PYEOF'
+    if A2A_INSTALL_CONFIG_FILE="$CONFIG_FILE" \
+       A2A_INSTALL_SECRET="$A2A_SECRET" \
+       A2A_INSTALL_HOME_PLATFORM="$HOME_PLATFORM" \
+       A2A_INSTALL_HOME_CHAT_ID="$HOME_CHAT_ID" \
+       A2A_INSTALL_HOME_USER_ID="$HOME_USER_ID" \
+       A2A_INSTALL_HOME_USER_NAME="$HOME_USER_NAME" \
+       python3 <<'PYEOF'
 import os
 import sys
 
 try:
     import yaml
 except ImportError:
-    # PyYAML not available — fall back to manual append
-    print("PyYAML not found, using fallback config writer", file=sys.stderr)
+    print("PyYAML not found; manual config is required", file=sys.stderr)
     sys.exit(1)
 
 config_path = os.environ["A2A_INSTALL_CONFIG_FILE"]
@@ -202,8 +201,7 @@ with open(config_path, "w") as f:
 
 print("OK")
 PYEOF
-
-    if [ $? -eq 0 ]; then
+    then
         echo "✓ Added a2a_trigger route to config.yaml"
     else
         # Fallback: just tell the user
