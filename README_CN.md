@@ -336,9 +336,12 @@ curl -X POST https://remote-agent \
      |-- A2A 请求 (tasks/send) ---------->| (plugin HTTP server :8081)
      |                                     |-- 消息入队
      |                                     |-- POST webhook → 触发 agent turn
+     |                                     |-- gateway 路由到主 session
+     |                                     |   （通过 config 里的 source override）
      |                                     |-- pre_llm_call 注入消息
      |                                     |-- agent 在完整上下文中回复
      |                                     |-- post_llm_call 捕获响应
+     |                                     |-- 回复发送回你的聊天窗口
      |<-- A2A 响应（同步）-----------------| (120 秒超时内)
 ```
 
@@ -357,6 +360,7 @@ curl -X POST https://remote-agent \
 - 不支持流式（A2A 协议支持 SSE，我们还没接）
 - Agent Card 的 skills 是硬编码的
 - 隐私保护最终依赖 agent 自律，代码只能挡已知模式
+- 同一个 session 里的 A2A 消息和用户消息会串行处理（一次一个 turn）——agent 不会打断你的当前对话，但 A2A 消息会排队等它处理
 
 ## 许可
 
