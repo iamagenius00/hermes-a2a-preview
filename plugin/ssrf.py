@@ -13,8 +13,8 @@ Public surface (consumed by P1.3 callsites in tools.py / friends.py):
     PinnedTarget, SSRFBlocked, UnconfiguredURL,
     DNSResolutionFailed, RedirectBlocked
 
-Implements the public-preview SSRF policy. Callsite wiring lives in the A2A
-tool and friend-management paths.
+Implements the SSRF/DNS-pin design contract for outbound A2A URLs.
+No callsite wiring here; that is handled by the caller layer.
 """
 
 from __future__ import annotations
@@ -40,6 +40,13 @@ _TRUE_VALUES = frozenset({"1", "true", "yes"})
 # Explicit IPv6 blocks that Python's is_global misses (NAT64 reports
 # is_global=True; multicast handled via is_multicast below).
 _EXPLICIT_BLOCK_V6 = (ipaddress.ip_network("64:ff9b::/96"),)
+FAKE_IP_ALLOW_SCOPE = "fake_ip_198_18"
+_FAKE_IP_TUNNEL_NET_V4 = ipaddress.ip_network("198.18.0.0/15")
+_TUNNEL_PROVIDER_SUFFIXES = (
+    ("trycloudflare", "trycloudflare.com"),
+    ("ngrok-free", "ngrok-free.app"),
+    ("ngrok", "ngrok.app"),
+)
 
 _IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
@@ -48,6 +55,10 @@ _IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 class SSRFBlocked(Exception):
     """Outbound URL targets a non-global / multicast / NAT64 / blocked IP."""
+
+    def __init__(self, message: str = "", *, recovery: Optional[dict] = None):
+        super().__init__(message)
+        self.recovery = recovery or {}
 
 
 class UnconfiguredURL(Exception):
@@ -75,7 +86,7 @@ class PinnedTarget:
     `canonical_url` is the URL that callsites MUST hand to opener.open().
     It is the post-IDNA, userinfo-stripped, fragment-stripped form of the
     input URL — passing the original URL to opener.open() can desync
-    SNI/Host from the validated host.
+    SNI/Host from the validated host (Codex P2.7).
     """
 
     hostname: str
@@ -95,7 +106,8 @@ def _is_dev_env() -> bool:
 def is_env_private_allowed() -> bool:
     """True iff A2A_ALLOW_PRIVATE_NETWORKS is set AND the dev gate is satisfied.
 
-    The env var is a dev/test escape hatch only; production cannot enable it.
+    Per Codex P1.4 closure: the env var is a dev/test escape hatch only;
+    production cannot enable it.
     """
     if os.getenv(_PRIVATE_NETWORK_ENV, "").lower() not in _TRUE_VALUES:
         return False
@@ -144,7 +156,7 @@ def _build_canonical_url(
     path: str,
     query: str,
 ) -> str:
-    """Return an opener-ready URL form.
+    """Codex P2.7: opener-ready URL form.
 
     `scheme://host[:port]/path[?query]`. IPv6 hosts bracketed; default
     ports (80/443) elided; userinfo and fragment never present (validator
@@ -205,6 +217,33 @@ def normalize_target_url(url: str) -> str:
     return f"{parsed.scheme}://{host_part}:{port}"
 
 
+def tunnel_provider_for_hostname(host: str) -> str:
+    """Return the supported quick-tunnel provider for a hostname, if any."""
+    if not host:
+        return ""
+    try:
+        ascii_host = host.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError:
+        return ""
+    for provider, suffix in _TUNNEL_PROVIDER_SUFFIXES:
+        if ascii_host == suffix or ascii_host.endswith("." + suffix):
+            return provider
+    return ""
+
+
+def tunnel_provider_for_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    return tunnel_provider_for_hostname(parsed.hostname or "")
+
+
+def is_fake_ip_tunnel_address(addr: _IPAddress) -> bool:
+    normalized = _normalize_addr(addr)
+    return isinstance(normalized, ipaddress.IPv4Address) and normalized in _FAKE_IP_TUNNEL_NET_V4
+
+
 def is_ip_literal_url(url: str) -> bool:
     """Whether ``url`` has an IP-literal host after parser normalization."""
     try:
@@ -254,6 +293,108 @@ def _is_blocked(addr: _IPAddress) -> bool:
     return False
 
 
+def _allowed_origin_matches(
+    allowed_origins,
+    *,
+    current_origin: str,
+    scope: str = FAKE_IP_ALLOW_SCOPE,
+) -> bool:
+    for entry in allowed_origins or ():
+        if isinstance(entry, str):
+            origin = entry.strip()
+            entry_scope = FAKE_IP_ALLOW_SCOPE
+        elif isinstance(entry, dict):
+            origin = str(entry.get("origin", "")).strip()
+            entry_scope = str(entry.get("scope", FAKE_IP_ALLOW_SCOPE)).strip() or FAKE_IP_ALLOW_SCOPE
+        else:
+            continue
+        if origin == current_origin and entry_scope == scope:
+            return True
+    return False
+
+
+def _blocked_hostname_message(
+    hostname: str,
+    addr: _IPAddress,
+    *,
+    current_origin: str = "",
+    provider: str = "",
+    is_configured_friend: bool = False,
+    allow_origin_hint_name: str = "",
+) -> str:
+    base = f"hostname {hostname} resolves to blocked address {addr}"
+    if is_fake_ip_tunnel_address(addr):
+        hint = (
+            f"origin {current_origin or hostname} hit 198.18.0.0/15, which is commonly used by TUN/fake-IP DNS modes "
+            "(Clash, Surge, WARP, and similar local proxies)"
+        )
+        if is_configured_friend:
+            name = allow_origin_hint_name or "<name>"
+            provider_note = f"; detected provider: {provider}" if provider else ""
+            hint += (
+                f"{provider_note}. If this is a trusted friend A2A origin, run "
+                f'/a2a friends allow-origin {name} --reason "<your reason>"; this only allows '
+                "this exact origin for fake-IP 198.18/15, not private networks. "
+                "Origin changes require re-approval"
+            )
+        else:
+            hint += "; add/configure this friend first, then allow the friend origin explicitly"
+        return f"{base} ({hint})"
+    return base
+
+
+def _blocked_hostname_recovery(
+    hostname: str,
+    addr: _IPAddress,
+    *,
+    current_origin: str,
+    provider: str = "",
+    is_configured_friend: bool = False,
+    allow_origin_hint_name: str = "",
+) -> dict:
+    if not is_fake_ip_tunnel_address(addr):
+        return {}
+    data = {
+        "code": "fake_ip_origin_blocked" if is_configured_friend else "fake_ip_origin_unconfigured",
+        "target_origin": current_origin,
+        "blocked_ip": str(addr),
+        "blocked_range": "198.18.0.0/15",
+        "reason": (
+            "198.18.0.0/15 is commonly used by TUN/fake-IP DNS modes "
+            "(Clash, Surge, WARP, and similar local proxies)."
+        ),
+        "risk_boundaries": [
+            "Approval only applies to this exact normalized origin.",
+            "Approval only covers fake-IP 198.18.0.0/15 results.",
+            "Approval does not allow RFC1918, loopback, link-local, metadata IPs, or IPv6 private ranges.",
+            "Origin changes require re-approval.",
+        ],
+    }
+    if provider:
+        data["origin_provider"] = provider
+    if is_configured_friend:
+        name = allow_origin_hint_name or "<name>"
+        data.update({
+            "requires_user_approval": True,
+            "friend_name": name if name != "<name>" else "",
+            "suggested_command_template": f'/a2a friends allow-origin {name} --reason "<your reason>"',
+            "suggested_reason_hint": (
+                "The reason must be written by the user and should explain why this exact "
+                "friend origin is trusted."
+            ),
+            "reason_must_be_user_supplied": True,
+            "suggested_prompt": (
+                f"Allow A2A outbound to {current_origin} when it resolves to fake-IP 198.18.0.0/15?"
+            ),
+        })
+    else:
+        data.update({
+            "requires_user_approval": False,
+            "next_step": "Add or configure this URL as a friend first, then allow the friend origin.",
+        })
+    return data
+
+
 # ---------- main validator ----------
 
 def validate_outbound_url(
@@ -263,6 +404,9 @@ def validate_outbound_url(
     allow_unconfigured: bool = False,
     is_configured_friend: bool = False,
     allow_env_private: bool = True,
+    approved_tunnel_origin: str = "",
+    allowed_origins=None,
+    allow_origin_hint_name: str = "",
 ) -> PinnedTarget:
     """Validate `url` for SSRF and return a DNS-pinned target.
 
@@ -277,6 +421,11 @@ def validate_outbound_url(
     `allow_private=True` (per-friend approval) lifts the non-global block.
     `allow_env_private=True` additionally allows the dev/test env escape hatch
     for explicit direct-dev callsites only.
+    `allowed_origins` is narrower: it only permits configured friend / config
+    targets whose exact normalized origin resolves into 198.18.0.0/15 fake-IP
+    space. It never permits RFC1918, loopback, link-local, metadata, IPv6
+    private, or arbitrary direct URLs. `approved_tunnel_origin` is retained as
+    a legacy alias while M2.1 transitions to the allow-origin model.
     """
     effective_allow_private = allow_private or (allow_env_private and is_env_private_allowed())
 
@@ -321,10 +470,9 @@ def validate_outbound_url(
         )
 
     # Step 3: hostname path — explicit `allow_private=True` is IP-literal-only
-    # (per-friend approvals only apply to IP literals). The dev/test env gate
-    # is the only path through which a hostname is permitted to resolve to a
-    # private address, and even then only because the operator has owned that
-    # risk via env vars.
+    # (Codex P2.4). The dev/test env gate is the only path through which a
+    # hostname is permitted to resolve to a private address, and even then
+    # only because the operator has owned that risk via env vars.
     if allow_private:
         raise SSRFBlocked(
             f"allow_private=True is only valid for IP-literal hosts; got hostname {raw_host!r}"
@@ -337,11 +485,29 @@ def validate_outbound_url(
         # Per D9: IDNA failure → SSRFBlocked (cannot meaningfully validate)
         raise SSRFBlocked(f"IDNA encoding failed for {raw_host!r}: {e}") from e
 
-    # Step 5: unconfigured guard BEFORE DNS — refusing to even
+    # Step 5: unconfigured guard BEFORE DNS (Codex P2.6) — refusing to even
     # resolve unconfigured hostnames closes the DNS-egress side channel that
     # would otherwise leak attacker-supplied lookups.
     if not allow_unconfigured and not is_configured_friend:
         raise UnconfiguredURL(f"URL not configured: {url}")
+
+    current_origin = normalize_target_url(url)
+    tunnel_provider = tunnel_provider_for_hostname(idna_host)
+    effective_allowed_origins = list(allowed_origins or ())
+    approved_tunnel_origin = (approved_tunnel_origin or "").strip()
+    if approved_tunnel_origin:
+        effective_allowed_origins.append({
+            "origin": approved_tunnel_origin,
+            "scope": FAKE_IP_ALLOW_SCOPE,
+        })
+    fake_ip_origin_allowed = (
+        is_configured_friend
+        and _allowed_origin_matches(
+            effective_allowed_origins,
+            current_origin=current_origin,
+            scope=FAKE_IP_ALLOW_SCOPE,
+        )
+    )
 
     # Step 6: resolve and block-check
     try:
@@ -364,8 +530,27 @@ def validate_outbound_url(
             raise SSRFBlocked(f"unparseable resolved address: {ip_str!r}")
         normalized = _normalize_addr(addr)
         if _is_blocked(normalized) and not effective_allow_private:
+            if fake_ip_origin_allowed and is_fake_ip_tunnel_address(normalized):
+                resolved.append((family, addr, ip_str))
+                continue
+            recovery = _blocked_hostname_recovery(
+                idna_host,
+                normalized,
+                current_origin=current_origin,
+                provider=tunnel_provider,
+                is_configured_friend=is_configured_friend,
+                allow_origin_hint_name=allow_origin_hint_name,
+            )
             raise SSRFBlocked(
-                f"hostname {idna_host} resolves to blocked address {normalized}"
+                _blocked_hostname_message(
+                    idna_host,
+                    normalized,
+                    current_origin=current_origin,
+                    provider=tunnel_provider,
+                    is_configured_friend=is_configured_friend,
+                    allow_origin_hint_name=allow_origin_hint_name,
+                ),
+                recovery=recovery,
             )
         resolved.append((family, addr, ip_str))
 
@@ -530,7 +715,7 @@ def build_ssrf_opener(
     """Build a urllib opener wired with:
 
     - `ProxyHandler({})` — disables HTTPS_PROXY / HTTP_PROXY / NO_PROXY env-var
-      proxy resolution. Without this the default opener would route
+      proxy resolution (Codex P1.3). Without this the default opener would route
       through `urllib.request.ProxyHandler`, which constructs its own
       HTTPConnection from the proxy URL and bypasses our pinned-IP subclass.
     - `_PinnedHTTPSHandler` / `_PinnedHTTPHandler` carrying `target.pinned_ip`.

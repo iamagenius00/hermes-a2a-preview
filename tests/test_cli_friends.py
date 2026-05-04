@@ -72,16 +72,17 @@ def test_add_reason_requires_private_url_flag(tmp_path):
         store=_store(tmp_path),
     )
 
-    assert result == "--reason requires --allow-private-url"
+    assert result == "--reason requires --allow-private-url or --allow-origin"
 
 
 def test_add_public_hostname_resolving_blocked_returns_controlled_error(tmp_path, monkeypatch):
     monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
 
-    result = cli.handle_friends_command("add friend https://friend-a2a-endpoint.example.com", store=_store(tmp_path))
+    result = cli.handle_friends_command("add demo_friend https://friend-a2a.example.com", store=_store(tmp_path))
 
     assert result.startswith("SSRF blocked:")
     assert "198.18.0.139" in result
+    assert "allow-origin" in result
 
 
 def test_list_shows_private_target_but_no_tokens(tmp_path):
@@ -113,6 +114,62 @@ def test_clear_private_url_revokes_approval(tmp_path):
 
     assert result == "Cleared private URL approval for local."
     assert store.get_by_name("local")["allow_private_target"] == ""
+
+
+def test_add_allowed_origin_friend_and_revoke_via_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    store = _store(tmp_path)
+
+    result = cli.handle_friends_command(
+        'add demo_friend https://friend-a2a.example.com --allow-origin --reason "I trust this exact demo friend origin for local fake-IP testing"',
+        store=store,
+    )
+
+    assert "Added friend demo_friend." in result
+    friend = store.get_by_name("demo_friend")
+    assert friend["allowed_origins"][0]["origin"] == "https://friend-a2a.example.com:443"
+    listed = cli.handle_friends_command("list", store=store)
+    assert "https://friend-a2a.example.com:443 [fake_ip_198_18, custom]" in listed
+    listed = cli.handle_friends_command("list-origins demo_friend", store=store)
+    assert "Allowed origins for demo_friend:" in listed
+
+    result = cli.handle_friends_command("revoke-origin demo_friend", store=store)
+
+    assert result == "Revoked allowed origin for demo_friend."
+    assert store.get_by_name("demo_friend")["allowed_origins"] == []
+
+
+def test_allow_origin_existing_friend_via_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    store = _store(tmp_path)
+    store.add_friend("demo_friend")
+    store.set_url("demo_friend", "https://friend-a2a.example.com/")
+
+    result = cli.handle_friends_command(
+        'allow-origin demo_friend --reason "I trust this exact demo friend origin for local fake-IP testing"',
+        store=store,
+    )
+
+    assert result == (
+        "Approved allowed origin for demo_friend: https://friend-a2a.example.com:443. "
+        "Origin changes require re-approval."
+    )
+    assert store.get_by_name("demo_friend")["allowed_origins"][0]["provider"] == "custom"
+
+
+def test_approve_tunnel_alias_still_maps_to_allow_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    store = _store(tmp_path)
+    store.add_friend("demo_friend")
+    store.set_url("demo_friend", "https://demo.ngrok.app/")
+
+    result = cli.handle_friends_command(
+        'approve-tunnel demo_friend --reason "ngrok quick tunnel direct friend A2A smoke"',
+        store=store,
+    )
+
+    assert "approve-tunnel is a legacy alias" in result
+    assert store.get_by_name("demo_friend")["allowed_origins"][0]["origin"] == "https://demo.ngrok.app:443"
 
 
 def test_status_commands_and_remove_confirmation(tmp_path):
@@ -184,6 +241,18 @@ def test_set_url_blocks_private_resolution(tmp_path, monkeypatch):
 
     assert result.startswith("SSRF blocked:")
     assert "10.0.0.5" in result
+
+
+def test_set_url_records_fake_ip_origin_with_next_step_hint(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.199"))
+    store = _store(tmp_path)
+    store.add_friend("demo_friend")
+
+    result = cli.handle_friends_command("set-url demo_friend https://friend-a2a.example.com", store=store)
+
+    assert "Outbound remains blocked" in result
+    assert '/a2a friends allow-origin demo_friend --reason "<your reason>"' in result
+    assert store.get_by_name("demo_friend")["url"] == "https://friend-a2a.example.com"
 
 
 def test_unknown_command_and_option_are_clear(tmp_path):

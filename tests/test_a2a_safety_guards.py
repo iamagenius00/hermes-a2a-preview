@@ -103,6 +103,9 @@ def test_http_request_validates_and_uses_canonical_url(monkeypatch):
             "allow_unconfigured": False,
             "is_configured_friend": True,
             "allow_env_private": False,
+            "approved_tunnel_origin": "",
+            "allowed_origins": None,
+            "allow_origin_hint_name": "",
         },
     )
     assert calls["open"] == ("http://example.com/encoded%20path", tools._DEFAULT_TIMEOUT)
@@ -136,6 +139,288 @@ def test_env_gate_does_not_allow_config_hostname_private_at_runtime(monkeypatch)
 
     assert result["error"].startswith("SSRF blocked:")
     assert "10.0.0.5" in result["error"]
+
+
+def test_friend_allowed_origin_allows_fake_ip_runtime(monkeypatch):
+    friend = {
+        "id": "f_friday",
+        "name": "demo_friend",
+        "url": "https://friend-a2a.example.com/",
+        "outbound_token": "",
+        "allowed_origins": [{
+            "origin": "https://friend-a2a.example.com:443",
+            "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+            "provider": "custom",
+            "expires_at": None,
+        }],
+    }
+    captured = {}
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            captured["url"] = req.full_url
+            return _FakeResponse({"name": "demo_friend", "skills": [], "capabilities": {}})
+
+    monkeypatch.setattr(tools, "_load_configured_agents", lambda: [])
+    monkeypatch.setattr(tools, "_friend_by_name", lambda name: friend if name == "demo_friend" else None)
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.139", 443))])
+    monkeypatch.setattr(ssrf, "build_ssrf_opener", lambda _target: FakeOpener())
+
+    result = json.loads(tools.handle_discover({"name": "demo_friend"}))
+
+    assert result["agent_name"] == "demo_friend"
+    assert captured["url"] == "https://friend-a2a.example.com/.well-known/agent.json"
+
+
+def test_direct_url_matching_friend_can_use_allowed_origin(monkeypatch):
+    friend = {
+        "id": "f_friday",
+        "name": "demo_friend",
+        "url": "https://friend-a2a.example.com/",
+        "outbound_token": "",
+        "allowed_origins": [{
+            "origin": "https://friend-a2a.example.com:443",
+            "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+            "provider": "custom",
+            "expires_at": None,
+        }],
+    }
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            return _FakeResponse({"name": "demo_friend", "skills": [], "capabilities": {}})
+
+    monkeypatch.setattr(tools, "_load_configured_agents", lambda: [])
+    monkeypatch.setattr(tools, "_friend_by_url", lambda url: friend if url == "https://friend-a2a.example.com" else None)
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.139", 443))])
+    monkeypatch.setattr(ssrf, "build_ssrf_opener", lambda _target: FakeOpener())
+
+    result = json.loads(tools.handle_discover({"url": "https://friend-a2a.example.com"}))
+
+    assert result["agent_name"] == "demo_friend"
+
+
+def test_direct_unconfigured_url_cannot_use_allowed_origin(monkeypatch):
+    monkeypatch.setenv("A2A_ALLOW_UNCONFIGURED_URLS", "true")
+    monkeypatch.setattr(tools, "_load_configured_agents", lambda: [])
+    monkeypatch.setattr(tools, "_friend_by_url", lambda url: None)
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.139", 443))])
+
+    result = json.loads(tools.handle_discover({"url": "https://friend-a2a.example.com"}))
+
+    assert result["error"].startswith("SSRF blocked:")
+    assert "198.18.0.139" in result["error"]
+    assert result["data"]["code"] == "fake_ip_origin_unconfigured"
+    assert result["data"]["requires_user_approval"] is False
+    assert "suggested_command" not in result["data"]
+    assert "suggested_command_template" not in result["data"]
+    assert "Add or configure" in result["data"]["next_step"]
+
+
+def test_fake_ip_blocked_known_friend_returns_recovery_contract(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_load_configured_agents",
+        lambda: [{
+            "name": "demo_friend",
+            "url": "https://friend-a2a.example.com/path?token=secret#frag",
+        }],
+    )
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.199", 443))])
+
+    result = json.loads(tools.handle_discover({"name": "demo_friend"}))
+
+    assert result["error"].startswith("SSRF blocked:")
+    assert result["data"]["code"] == "fake_ip_origin_blocked"
+    assert result["data"]["requires_user_approval"] is True
+    assert result["data"]["friend_name"] == "demo_friend"
+    assert result["data"]["target_origin"] == "https://friend-a2a.example.com:443"
+    assert result["data"]["blocked_ip"] == "198.18.0.199"
+    assert result["data"]["blocked_range"] == "198.18.0.0/15"
+    assert "suggested_command" not in result["data"]
+    assert result["data"]["suggested_command_template"] == '/a2a friends allow-origin demo_friend --reason "<your reason>"'
+    assert result["data"]["reason_must_be_user_supplied"] is True
+    assert "written by the user" in result["data"]["suggested_reason_hint"]
+    encoded = json.dumps(result["data"])
+    assert "token=secret" not in encoded
+    assert "#frag" not in encoded
+    assert "/path" not in encoded
+
+
+def test_config_allowed_origin_allows_custom_domain_fake_ip_runtime(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_load_configured_agents",
+        lambda: [{
+            "name": "demo_friend",
+            "url": "https://friend-a2a.example.com/",
+            "allowed_origins": [{
+                "origin": "https://friend-a2a.example.com",
+                "reason": "I trust this exact demo friend origin for local fake-IP testing",
+            }],
+        }],
+    )
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            return _FakeResponse({"name": "demo_friend", "skills": [], "capabilities": {}})
+
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.140", 443))])
+    monkeypatch.setattr(ssrf, "build_ssrf_opener", lambda _target: FakeOpener())
+
+    result = json.loads(tools.handle_discover({"name": "demo_friend"}))
+
+    assert result["agent_name"] == "demo_friend"
+
+
+def test_config_allowed_origin_does_not_allow_rfc1918_runtime(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_load_configured_agents",
+        lambda: [{
+            "name": "demo_friend",
+            "url": "https://friend-a2a.example.com/",
+            "allowed_origins": [{
+                "origin": "https://friend-a2a.example.com:443",
+                "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+                "reason": "I trust this exact demo friend origin for local fake-IP testing",
+            }],
+        }],
+    )
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("10.0.0.5", 443))])
+
+    result = json.loads(tools.handle_discover({"name": "demo_friend"}))
+
+    assert result["error"].startswith("SSRF blocked:")
+    assert "10.0.0.5" in result["error"]
+
+
+def test_config_allowed_origin_expiry_disables_fake_ip_allow(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_load_configured_agents",
+        lambda: [{
+            "name": "demo_friend",
+            "url": "https://friend-a2a.example.com/",
+            "allowed_origins": [{
+                "origin": "https://friend-a2a.example.com:443",
+                "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+                "reason": "I trust this exact demo friend origin for local fake-IP testing",
+                "expires_at": "2000-01-01T00:00:00+00:00",
+            }],
+        }],
+    )
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.139", 443))])
+
+    result = json.loads(tools.handle_discover({"name": "demo_friend"}))
+
+    assert result["error"].startswith("SSRF blocked:")
+    assert "198.18.0.139" in result["error"]
+
+
+def test_handle_call_fake_ip_block_returns_recovery_contract(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_load_configured_agents",
+        lambda: [{
+            "name": "demo_friend",
+            "url": "https://friend-a2a.example.com/",
+            "auth_token": "",
+        }],
+    )
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.199", 443))])
+    monkeypatch.setattr(persistence, "save_exchange", lambda **_kwargs: None)
+    monkeypatch.setattr(persistence, "update_exchange", lambda **_kwargs: None)
+    monkeypatch.setattr("plugin.security.audit.log", lambda *_args, **_kwargs: None)
+
+    result = json.loads(tools.handle_call({
+        "name": "demo_friend",
+        "message": "hello",
+        "task_id": "local-task",
+    }))
+
+    assert result["error"].startswith("SSRF blocked:")
+    assert result["data"]["code"] == "fake_ip_origin_blocked"
+    assert result["data"]["requires_user_approval"] is True
+    assert "suggested_command" not in result["data"]
+    assert result["data"]["suggested_command_template"] == '/a2a friends allow-origin demo_friend --reason "<your reason>"'
+    assert result["data"]["reason_must_be_user_supplied"] is True
+
+
+def test_origin_audit_uses_origin_not_raw_url_query_fragment(monkeypatch):
+    events = []
+    monkeypatch.setattr(tools, "_load_configured_agents", lambda: [])
+    monkeypatch.setattr(tools, "_friend_by_url", lambda url: {
+        "id": "f_friday",
+        "name": "demo_friend",
+        "url": "https://friend-a2a.example.com/path?token=secret#frag",
+        "outbound_token": "",
+        "allowed_origins": [{
+            "origin": "https://friend-a2a.example.com:443",
+            "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+            "provider": "custom",
+            "expires_at": None,
+        }],
+    })
+    monkeypatch.setattr("plugin.security.audit.log", lambda event, data: events.append((event, data)))
+    monkeypatch.setattr(
+        tools,
+        "_http_request",
+        lambda *args, **kwargs: {"name": "demo_friend", "skills": [], "capabilities": {}},
+    )
+
+    result = json.loads(tools.handle_discover({"url": "https://friend-a2a.example.com/path?token=secret#frag"}))
+
+    assert result["agent_name"] == "demo_friend"
+    event, data = events[-1]
+    assert event == "discover"
+    assert data["target_origin"] == "https://friend-a2a.example.com:443"
+    assert data["origin_provider"] == "custom"
+    encoded = json.dumps(data)
+    assert "token=secret" not in encoded
+    assert "#frag" not in encoded
+    assert "/path" not in encoded
+
+
+def test_direct_url_call_persistence_label_uses_policy_name_not_raw_query_fragment(monkeypatch):
+    direct_url = "https://friend-a2a.example.com/path?token=secret#frag"
+    saved = []
+    updated = []
+
+    monkeypatch.setattr(
+        tools,
+        "_load_configured_agents",
+        lambda: [{"name": "demo_friend", "url": direct_url, "auth_token": ""}],
+    )
+    monkeypatch.setattr(tools, "_friend_by_url", lambda url: None)
+    monkeypatch.setattr("plugin.security.audit.log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        tools,
+        "_http_request",
+        lambda *args, **kwargs: {
+            "result": {
+                "id": "remote-task",
+                "status": {"state": "completed"},
+                "artifacts": [{"parts": [{"type": "text", "text": "ok"}]}],
+            }
+        },
+    )
+    monkeypatch.setattr(persistence, "save_exchange", lambda **kwargs: saved.append(kwargs))
+    monkeypatch.setattr(persistence, "update_exchange", lambda **kwargs: updated.append(kwargs))
+
+    result = json.loads(tools.handle_call({
+        "url": direct_url,
+        "message": "hello",
+        "task_id": "local-task",
+    }))
+
+    assert result["response"] == "ok"
+    assert saved[0]["agent_name"] == "demo_friend"
+    assert updated[0]["agent_name"] == "demo_friend"
+    persisted = json.dumps({"saved": saved, "updated": updated})
+    assert "token=secret" not in persisted
+    assert "#frag" not in persisted
+    assert "/path" not in persisted
 
 
 def test_configured_private_agent_declared_target_is_allowed():
@@ -173,7 +458,80 @@ def test_runtime_config_validation_drops_agents_softly(monkeypatch, caplog):
     with caplog.at_level("ERROR", logger="plugin.tools"):
         assert tools._load_configured_agents() == []
 
-    assert "config invalid at runtime, dropping agents" in caplog.text
+    assert "a2a.agents config invalid at runtime:" in caplog.text
+    tools._last_config_validation_error = ""
+
+
+def test_runtime_config_validation_error_surfaces_for_named_target(monkeypatch):
+    fake_config = SimpleNamespace(load_config=lambda: {"a2a": {"agents": [{
+        "name": "DemoFriend",
+        "url": "https://friend-a2a.example.com/",
+        "allowed_origins": [{
+            "origin": "http://friend-a2a.example.com",
+            "reason": "I trust this exact demo friend origin for local fake-IP testing",
+        }],
+    }]}})
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
+
+    result = json.loads(tools.handle_discover({"name": "DemoFriend"}))
+
+    assert result["error"].startswith("a2a.agents config invalid at runtime:")
+    assert 'config a2a.agents[0] (DemoFriend) allowed_origins[0].origin "http://friend-a2a.example.com"' in result["error"]
+    assert 'Expected: "https://friend-a2a.example.com:443" (port normalized)' in result["error"]
+    assert 'Got: "http://friend-a2a.example.com:80"' in result["error"]
+    tools._last_config_validation_error = ""
+
+
+def test_handle_list_surfaces_runtime_config_validation_error(monkeypatch):
+    fake_config = SimpleNamespace(load_config=lambda: {"a2a": {"agents": [{
+        "name": "DemoFriend",
+        "url": "https://friend-a2a.example.com/",
+        "allowed_origins": [{
+            "origin": "https://wrong.example",
+            "reason": "I trust this exact demo friend origin for local fake-IP testing",
+        }],
+    }]}})
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
+
+    result = json.loads(tools.handle_list({}))
+
+    assert result["error"].startswith("a2a.agents config invalid at runtime:")
+    assert "DemoFriend" in result["error"]
+    assert 'Expected: "https://friend-a2a.example.com:443"' in result["error"]
+    tools._last_config_validation_error = ""
+
+
+def test_config_allowed_origin_rejects_path_query_fragment_without_echoing_secret():
+    with pytest.raises(ValueError) as exc:
+        tools._validate_configured_agents([{
+            "name": "DemoFriend",
+            "url": "https://friend-a2a.example.com/",
+            "allowed_origins": [{
+                "origin": "https://friend-a2a.example.com/path?token=secret#frag",
+                "reason": "I trust this exact demo friend origin for local fake-IP testing",
+            }],
+        }])
+
+    msg = str(exc.value)
+    assert "allowed_origins[0].origin must be an origin only" in msg
+    assert 'Expected: "https://friend-a2a.example.com:443"' in msg
+    assert "token=secret" not in msg
+
+
+def test_config_allowed_origin_scope_defaults_when_omitted_and_origin_port_normalizes():
+    agent = {
+        "name": "DemoFriend",
+        "url": "https://friend-a2a.example.com/",
+        "allowed_origins": [{
+            "origin": "https://friend-a2a.example.com",
+            "reason": "I trust this exact demo friend origin for local fake-IP testing",
+        }],
+    }
+
+    assert tools._validate_configured_agents([agent]) == [agent]
+    allowed = tools._agent_allowed_origins(agent, 0)
+    assert allowed[0]["origin"] == "https://friend-a2a.example.com:443"
+    assert allowed[0]["scope"] == ssrf.FAKE_IP_ALLOW_SCOPE
 
 
 def test_configured_private_agent_rejects_short_reason():
@@ -495,8 +853,8 @@ def test_handle_call_direct_friend_url_policy_wins_over_matching_config(monkeypa
 
 def test_register_allows_configured_agent_resolving_blocked_address(monkeypatch):
     fake_config = SimpleNamespace(load_config=lambda: {"a2a": {"agents": [{
-        "name": "friend",
-        "url": "http://friend-a2a-endpoint.example.com",
+        "name": "han1",
+        "url": "http://friend-a2a.example.com",
     }]}})
     monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
     monkeypatch.setenv("A2A_ENABLED", "true")
@@ -527,12 +885,12 @@ def test_register_allows_configured_agent_resolving_blocked_address(monkeypatch)
 
 def test_configured_agent_blocked_dns_returns_controlled_discover_error(monkeypatch):
     monkeypatch.setattr(tools, "_load_configured_agents", lambda: [{
-        "name": "friend",
-        "url": "http://friend-a2a-endpoint.example.com",
+        "name": "han1",
+        "url": "http://friend-a2a.example.com",
     }])
     monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.139", 80))])
 
-    result = json.loads(tools.handle_discover({"name": "friend"}))
+    result = json.loads(tools.handle_discover({"name": "han1"}))
 
     assert result["error"].startswith("SSRF blocked:")
     assert "198.18.0.139" in result["error"]
@@ -540,8 +898,8 @@ def test_configured_agent_blocked_dns_returns_controlled_discover_error(monkeypa
 
 def test_configured_agent_blocked_dns_returns_controlled_call_error(monkeypatch):
     monkeypatch.setattr(tools, "_load_configured_agents", lambda: [{
-        "name": "friend",
-        "url": "http://friend-a2a-endpoint.example.com",
+        "name": "han1",
+        "url": "http://friend-a2a.example.com",
     }])
     monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: [(2, 1, 0, "", ("198.18.0.139", 80))])
     monkeypatch.setattr(tools, "_consume_rate_limit", lambda: True)
@@ -549,7 +907,7 @@ def test_configured_agent_blocked_dns_returns_controlled_call_error(monkeypatch)
     monkeypatch.setattr(persistence, "update_exchange", lambda *args, **kwargs: None)
 
     result = json.loads(tools.handle_call({
-        "name": "friend",
+        "name": "han1",
         "message": "hello",
         "task_id": "task-1",
     }))

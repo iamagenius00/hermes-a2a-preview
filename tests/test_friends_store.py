@@ -421,6 +421,134 @@ def test_set_url_wraps_deep_url_validation_errors_as_value_error(tmp_path):
         store.set_url("alice", "http://127.0.0.1:99999/")
 
 
+# ── M2.1: friend direct fake-IP origin allowlist ─────────────────────
+
+
+def test_add_friend_allowed_origin_binds_origin_and_hides_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    events = []
+    monkeypatch.setattr(security_module.audit, "log", lambda event, data: events.append((event, data)))
+    reason = "I trust this exact demo friend origin for local fake-IP testing"
+    path = tmp_path / "friends.json"
+    store = FriendsStore(path=path)
+
+    friend, _ = store.add_friend(
+        "demo_friend",
+        url="https://friend-a2a.example.com/path?token=secret#frag",
+        allow_origin=True,
+        allow_origin_reason=reason,
+    )
+
+    assert friend["allowed_origins"] == [{
+        "origin": "https://friend-a2a.example.com:443",
+        "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+        "reason_hash": friend["allowed_origins"][0]["reason_hash"],
+        "reason_length_bucket": "51-100",
+        "created_at": friend["allowed_origins"][0]["created_at"],
+        "expires_at": None,
+        "provider": "custom",
+    }]
+    assert friend["allowed_origins"][0]["reason_hash"].startswith("sha256:")
+    on_disk = path.read_text(encoding="utf-8")
+    assert reason not in on_disk
+    assert "token=secret" in on_disk  # friend URL is user-managed runtime state
+    event, data = events[-1]
+    assert event == "friend_origin_allowed"
+    assert data["provider"] == "custom"
+    assert data["scope"] == ssrf.FAKE_IP_ALLOW_SCOPE
+    assert data["target_origin_hash"].startswith("sha256:")
+    assert data["reason_present"] is True
+    assert data["reason_length_bucket"] == "51-100"
+    assert "friend-a2a.example.com" not in json.dumps(data)
+    assert "token=secret" not in json.dumps(data)
+    assert reason not in json.dumps(data)
+
+
+def test_allowed_origin_accepts_custom_domain(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    store = FriendsStore(path=tmp_path / "friends.json")
+
+    friend, _ = store.add_friend(
+        "friend",
+        url="https://example.com/",
+        allow_origin=True,
+        allow_origin_reason="custom domain direct friend A2A fake-IP testing",
+    )
+
+    assert friend["allowed_origins"][0]["origin"] == "https://example.com:443"
+    assert friend["allowed_origins"][0]["provider"] == "custom"
+
+
+def test_allowed_origin_does_not_allow_rfc1918_resolution(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("10.0.0.5"))
+    store = FriendsStore(path=tmp_path / "friends.json")
+
+    with pytest.raises(ssrf.SSRFBlocked):
+        store.add_friend(
+            "friend",
+            url="https://demo.trycloudflare.com/",
+            allow_origin=True,
+            allow_origin_reason="quick tunnel direct friend A2A testing",
+        )
+
+
+def test_allow_revoke_and_list_origin_for_existing_friend(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    events = []
+    monkeypatch.setattr(security_module.audit, "log", lambda event, data: events.append((event, data)))
+    store = FriendsStore(path=tmp_path / "friends.json")
+    store.add_friend("demo_friend")
+    assert store.set_url("demo_friend", "https://friend-a2a.example.com/")
+
+    assert store.allow_origin("demo_friend", "I trust this exact demo friend origin for local fake-IP testing")
+    friend = store.get_by_name("demo_friend")
+    assert friend["allowed_origins"][0]["origin"] == "https://friend-a2a.example.com:443"
+    assert friend["allowed_origins"][0]["provider"] == "custom"
+    assert store.list_allowed_origins("demo_friend")[0]["scope"] == ssrf.FAKE_IP_ALLOW_SCOPE
+
+    assert store.revoke_origin("demo_friend")
+    friend = store.get_by_name("demo_friend")
+    assert friend["allowed_origins"] == []
+    event, data = events[-1]
+    assert event == "friend_origin_revoked"
+    assert data["provider"] == "custom"
+    assert data["scope"] == ssrf.FAKE_IP_ALLOW_SCOPE
+    assert data["target_origin_hash"].startswith("sha256:")
+    assert "friend-a2a.example.com" not in json.dumps(data)
+
+
+def test_set_url_removes_non_matching_allowed_origins(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    store = FriendsStore(path=tmp_path / "friends.json")
+    store.add_friend(
+        "demo_friend",
+        url="https://friend-a2a.example.com/first",
+        allow_origin=True,
+        allow_origin_reason="I trust this exact demo friend origin for local fake-IP testing",
+    )
+
+    assert store.set_url("demo_friend", "https://other.example.com/second")
+
+    friend = store.get_by_name("demo_friend")
+    assert friend["allowed_origins"] == []
+
+
+def test_set_url_keeps_matching_allowed_origin_for_path_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", lambda *args, **kwargs: _gai("198.18.0.139"))
+    store = FriendsStore(path=tmp_path / "friends.json")
+    store.add_friend(
+        "demo_friend",
+        url="https://friend-a2a.example.com/first",
+        allow_origin=True,
+        allow_origin_reason="I trust this exact demo friend origin for local fake-IP testing",
+    )
+
+    assert store.set_url("demo_friend", "https://friend-a2a.example.com/second")
+
+    friend = store.get_by_name("demo_friend")
+    assert friend["allowed_origins"][0]["origin"] == "https://friend-a2a.example.com:443"
+
+
 # ── lifecycle: pause / block / remove / persist ───────────────────────
 
 

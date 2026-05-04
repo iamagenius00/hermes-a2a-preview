@@ -65,11 +65,13 @@ from typing import Optional
 from .paths import friends_path
 from .ssrf import (
     DNSResolutionFailed,
+    FAKE_IP_ALLOW_SCOPE,
     RedirectBlocked,
     SSRFBlocked,
     UnconfiguredURL,
     is_ip_literal_url,
     normalize_target_url,
+    tunnel_provider_for_url,
     validate_outbound_url,
 )
 
@@ -129,6 +131,10 @@ def _private_reason_bucket(reason: str) -> str:
     return "100+"
 
 
+def _audit_hash(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _is_http_url_shape(url: str) -> bool:
     from urllib.parse import urlparse
 
@@ -150,6 +156,129 @@ def _audit_ssrf_blocked(name: str, url: str, exc: Exception) -> None:
         })
     except Exception:
         logger.debug("Failed to write ssrf_blocked audit event", exc_info=True)
+
+
+def _empty_origin_fields() -> dict:
+    return {"allowed_origins": []}
+
+
+def _origin_provider(url: str) -> str:
+    return tunnel_provider_for_url(url) or "custom"
+
+
+def _clear_legacy_tunnel_fields(friend: dict) -> None:
+    for key in (
+        "approved_tunnel_origin",
+        "approved_tunnel_provider",
+        "approved_tunnel_reason_hash",
+        "approved_tunnel_reason_length_bucket",
+        "approved_tunnel_expires_at",
+    ):
+        friend.pop(key, None)
+
+
+def _normalize_origin_entry(entry: dict) -> Optional[dict]:
+    if not isinstance(entry, dict):
+        return None
+    origin = (entry.get("origin") or "").strip()
+    if not origin:
+        return None
+    scope = (entry.get("scope") or FAKE_IP_ALLOW_SCOPE).strip()
+    if scope != FAKE_IP_ALLOW_SCOPE:
+        return None
+    normalized = {
+        "origin": origin,
+        "scope": FAKE_IP_ALLOW_SCOPE,
+        "reason_hash": entry.get("reason_hash", ""),
+        "reason_length_bucket": entry.get("reason_length_bucket", ""),
+        "created_at": entry.get("created_at") or None,
+        "expires_at": entry.get("expires_at") or None,
+        "provider": entry.get("provider") or "custom",
+    }
+    return normalized
+
+
+def _legacy_allowed_origin(friend: dict) -> Optional[dict]:
+    origin = (friend or {}).get("approved_tunnel_origin", "")
+    if not origin:
+        return None
+    return {
+        "origin": origin,
+        "scope": FAKE_IP_ALLOW_SCOPE,
+        "reason_hash": (friend or {}).get("approved_tunnel_reason_hash", ""),
+        "reason_length_bucket": (friend or {}).get("approved_tunnel_reason_length_bucket", ""),
+        "created_at": None,
+        "expires_at": (friend or {}).get("approved_tunnel_expires_at"),
+        "provider": (friend or {}).get("approved_tunnel_provider") or "custom",
+    }
+
+
+def effective_allowed_origins(friend: dict) -> list[dict]:
+    entries: list[dict] = []
+    for entry in (friend or {}).get("allowed_origins") or []:
+        normalized = _normalize_origin_entry(entry)
+        if normalized:
+            entries.append(normalized)
+    legacy = _legacy_allowed_origin(friend)
+    if legacy and not any(e.get("origin") == legacy["origin"] and e.get("scope") == legacy["scope"] for e in entries):
+        entries.append(legacy)
+    return entries
+
+
+def _validate_origin_allow(url: str, reason: str, expires_at: Optional[str] = None) -> dict:
+    if not url:
+        raise ValueError("allow-origin requires a url")
+    if len((reason or "").strip()) < 20:
+        raise ValueError("allow-origin requires a reason of at least 20 characters")
+    origin = normalize_target_url(url)
+    entry = {
+        "origin": origin,
+        "scope": FAKE_IP_ALLOW_SCOPE,
+        "reason_hash": _audit_hash((reason or "").strip()),
+        "reason_length_bucket": _private_reason_bucket(reason),
+        "created_at": _isoformat(_now()),
+        "expires_at": expires_at,
+        "provider": _origin_provider(url),
+    }
+    validate_outbound_url(
+        url,
+        allow_private=False,
+        allow_unconfigured=True,
+        is_configured_friend=True,
+        allow_env_private=False,
+        allowed_origins=[entry],
+    )
+    return entry
+
+
+def _audit_origin_allowed(friend_id: str, entry: dict, reason: str) -> None:
+    try:
+        from .security import audit
+
+        audit.log("friend_origin_allowed", {
+            "friend_id": friend_id,
+            "provider": entry.get("provider", "custom"),
+            "scope": entry.get("scope", FAKE_IP_ALLOW_SCOPE),
+            "target_origin_hash": _audit_hash(entry.get("origin", "")),
+            "reason_present": bool((reason or "").strip()),
+            "reason_length_bucket": entry.get("reason_length_bucket", ""),
+        })
+    except Exception:
+        logger.debug("Failed to write origin allow audit event", exc_info=True)
+
+
+def _audit_origin_revoked(friend_id: str, entry: dict) -> None:
+    try:
+        from .security import audit
+
+        audit.log("friend_origin_revoked", {
+            "friend_id": friend_id,
+            "provider": entry.get("provider", "custom"),
+            "scope": entry.get("scope", FAKE_IP_ALLOW_SCOPE),
+            "target_origin_hash": _audit_hash(entry.get("origin", "")),
+        })
+    except Exception:
+        logger.debug("Failed to write origin revoke audit event", exc_info=True)
 
 
 class FriendsStore:
@@ -402,6 +531,12 @@ class FriendsStore:
         outbound_token: str = "",
         allow_private_url: bool = False,
         allow_private_reason: str = "",
+        allow_origin: bool = False,
+        allow_origin_reason: str = "",
+        allow_origin_expires_at: Optional[str] = None,
+        approve_tunnel: bool = False,
+        approved_tunnel_reason: str = "",
+        approved_tunnel_expires_at: Optional[str] = None,
         trust_level: str = DEFAULT_TRUST_LEVEL,
         rate_limit_per_min: int = DEFAULT_RATE_LIMIT_PER_MIN,
         max_message_chars: int = DEFAULT_MAX_MESSAGE_CHARS,
@@ -424,6 +559,10 @@ class FriendsStore:
             raise ValueError("pending_days must be non-negative")
         allow_private_target = ""
         allow_private_reason = allow_private_reason or ""
+        allowed_origins: list[dict] = []
+        effective_allow_origin = allow_origin or approve_tunnel
+        effective_origin_reason = allow_origin_reason or approved_tunnel_reason
+        effective_origin_expires_at = allow_origin_expires_at if allow_origin_expires_at is not None else approved_tunnel_expires_at
         if url:
             if allow_private_url:
                 if not is_ip_literal_url(url):
@@ -431,6 +570,12 @@ class FriendsStore:
                 allow_private_target = normalize_target_url(url)
                 if len(allow_private_reason.strip()) < 20:
                     raise ValueError("allow_private_url requires a reason of at least 20 characters")
+            if effective_allow_origin:
+                allowed_origins = [_validate_origin_allow(
+                    url,
+                    effective_origin_reason,
+                    effective_origin_expires_at,
+                )]
             try:
                 validate_outbound_url(
                     url,
@@ -438,12 +583,15 @@ class FriendsStore:
                     allow_unconfigured=True,
                     is_configured_friend=True,
                     allow_env_private=False,
+                    allowed_origins=allowed_origins,
                 )
             except (SSRFBlocked, UnconfiguredURL, DNSResolutionFailed, RedirectBlocked) as exc:
                 _audit_ssrf_blocked(name, url, exc)
                 raise
         elif allow_private_url:
             raise ValueError("allow_private_url requires a url")
+        elif effective_allow_origin:
+            raise ValueError("allow-origin requires a url")
 
         with self._lock, self._file_lock():
             data = self._read_unlocked()
@@ -463,6 +611,7 @@ class FriendsStore:
                 "url": url,
                 "allow_private_target": allow_private_target,
                 "allow_private_reason": allow_private_reason if allow_private_target else "",
+                "allowed_origins": allowed_origins,
                 "inbound_token_hash": _hash_token(raw_token),
                 "outbound_token": outbound_token,
                 "trust_level": trust_level,
@@ -488,6 +637,8 @@ class FriendsStore:
                     })
                 except Exception:
                     logger.debug("Failed to write private URL audit event", exc_info=True)
+            for entry in allowed_origins:
+                _audit_origin_allowed(friend["id"], entry, effective_origin_reason)
             data["friends"].append(friend)
             self._write_unlocked(data)
             return dict(friend), raw_token
@@ -499,7 +650,7 @@ class FriendsStore:
         ``a2a_friends.json``. The audit log (``a2a_audit.jsonl``) is
         append-only and is not touched. Historical audit entries that
         reference the removed ``friend_id`` are deliberately preserved as
-        the historical record. UI and CLI surfaces should render those as
+        the historical record. The dashboard / CLI should render those as
         "(removed friend)" or similar when displaying past events.
         """
         with self._lock, self._file_lock():
@@ -608,6 +759,11 @@ class FriendsStore:
                     if not normalized_target or not previous_target or normalized_target != previous_target:
                         f["allow_private_target"] = ""
                         f["allow_private_reason"] = ""
+                    f["allowed_origins"] = [
+                        entry for entry in effective_allowed_origins(f)
+                        if normalized_target and entry.get("origin") == normalized_target
+                    ]
+                    _clear_legacy_tunnel_fields(f)
                     self._write_unlocked(data)
                     return True
             return False
@@ -622,6 +778,76 @@ class FriendsStore:
                     self._write_unlocked(data)
                     return True
             return False
+
+    def allow_origin(
+        self,
+        name_or_id: str,
+        reason: str,
+        expires_at: Optional[str] = None,
+    ) -> bool:
+        with self._lock, self._file_lock():
+            data = self._read_unlocked()
+            for f in data["friends"]:
+                if f.get("id") == name_or_id or f.get("name") == name_or_id:
+                    entry = _validate_origin_allow(f.get("url", ""), reason, expires_at)
+                    entries = [
+                        item for item in effective_allowed_origins(f)
+                        if item.get("origin") != entry["origin"] or item.get("scope") != entry["scope"]
+                    ]
+                    entries.append(entry)
+                    f["allowed_origins"] = entries
+                    _clear_legacy_tunnel_fields(f)
+                    self._write_unlocked(data)
+                    _audit_origin_allowed(f.get("id", ""), entry, reason)
+                    return True
+            return False
+
+    def revoke_origin(self, name_or_id: str, origin: str = "") -> bool:
+        with self._lock, self._file_lock():
+            data = self._read_unlocked()
+            for f in data["friends"]:
+                if f.get("id") == name_or_id or f.get("name") == name_or_id:
+                    target_origin = ""
+                    if origin:
+                        target_origin = normalize_target_url(origin)
+                    elif f.get("url"):
+                        target_origin = normalize_target_url(f.get("url", ""))
+                    previous_entries = effective_allowed_origins(f)
+                    remaining = []
+                    revoked = []
+                    for entry in previous_entries:
+                        if target_origin and entry.get("origin") == target_origin:
+                            revoked.append(entry)
+                        elif not target_origin:
+                            revoked.append(entry)
+                        else:
+                            remaining.append(entry)
+                    f["allowed_origins"] = remaining
+                    _clear_legacy_tunnel_fields(f)
+                    self._write_unlocked(data)
+                    for entry in revoked:
+                        _audit_origin_revoked(f.get("id", ""), entry)
+                    return True
+            return False
+
+    def list_allowed_origins(self, name_or_id: str) -> Optional[list[dict]]:
+        with self._lock, self._file_lock():
+            data = self._read_unlocked()
+            for f in data["friends"]:
+                if f.get("id") == name_or_id or f.get("name") == name_or_id:
+                    return [dict(entry) for entry in effective_allowed_origins(f)]
+            return None
+
+    def approve_tunnel(
+        self,
+        name_or_id: str,
+        reason: str,
+        expires_at: Optional[str] = None,
+    ) -> bool:
+        return self.allow_origin(name_or_id, reason, expires_at)
+
+    def revoke_tunnel(self, name_or_id: str) -> bool:
+        return self.revoke_origin(name_or_id)
 
     def record_last_contact(self, name_or_id: str) -> bool:
         """Record a successful inbound auth from this friend.
@@ -664,6 +890,7 @@ class FriendsStore:
                 "url": "",
                 "allow_private_target": "",
                 "allow_private_reason": "",
+                **_empty_origin_fields(),
                 "inbound_token_hash": _hash_token(raw_token),
                 "outbound_token": "",
                 "trust_level": "normal",

@@ -177,6 +177,72 @@ M2 is still intentionally conservative:
 - Streaming/SSE, hosted registry, relay/mailbox fallback, and mobile approval
   flows are not included yet.
 
+### Fake-IP / tunnel origin approval
+
+The main M2.1 compatibility path is direct friend-agent communication over a
+temporary tunnel such as cloudflared or ngrok. To let a friend reach your
+agent, expose your local A2A port and send them the tunnel URL plus the
+one-time inbound token from `/a2a friends add`:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8081
+```
+
+To call a friend's tunneled agent from your side, add their tunnel URL as that
+friend's A2A URL. The URL may be a provider hostname such as
+`*.trycloudflare.com`, `*.ngrok-free.app`, or `*.ngrok.app`, or a custom domain
+such as `friend-a2a.example.com`.
+
+Some local proxy/TUN setups resolve friend hostnames to `198.18.x.x` fake-IP
+addresses. Hermes blocks that by default because `198.18.0.0/15` is non-public
+benchmark address space. If the URL is an intentional friend origin, allow the
+exact origin explicitly:
+
+```text
+/a2a friends add demo_friend https://friend-a2a.example.com --allow-origin --reason "I trust this exact demo friend origin for local fake-IP testing"
+```
+
+Or, for an existing friend:
+
+```text
+/a2a friends set-url demo_friend https://friend-a2a.example.com
+/a2a friends allow-origin demo_friend --reason "I trust this exact demo friend origin for local fake-IP testing"
+/a2a friends list-origins demo_friend
+/a2a friends revoke-origin demo_friend
+```
+
+After approval, retry `a2a_discover` or `a2a_call` for that friend. If the
+origin changed, the call will be denied again and must be re-approved.
+
+For config.yaml-managed agents, the same approval is explicit data:
+
+```yaml
+a2a:
+  agents:
+    - name: demo_friend
+      url: https://friend-a2a.example.com
+      allowed_origins:
+        - origin: https://friend-a2a.example.com
+          reason: "I trust this exact demo friend origin for local fake-IP testing"
+```
+
+Fake-IP origin approval is deliberately narrow:
+
+- It binds to the exact normalized origin only: scheme + host + explicit port
+  (`https` defaults to `:443`, `http` defaults to `:80`). In config.yaml,
+  `origin: https://friend-a2a.example.com` is accepted and normalized internally.
+- Config `scope` may be omitted in M2.1; it defaults to `fake_ip_198_18`.
+- Quick Tunnel URLs and custom-domain targets can change. A changed origin
+  requires re-approval.
+- No wildcard approval exists in M2.1.
+- Approval only covers `198.18.0.0/15` fake-IP results for a configured
+  friend/config target. It does not allow RFC1918, loopback, link-local,
+  metadata IPs, IPv6 private ranges, or arbitrary direct URL fetches.
+- This is not private-network approval. Use the separate IP-literal
+  `--allow-private-url --reason ...` flow for explicit local dev targets.
+- Redirects are not followed.
+- Tailnet / `ts.net` private-network targets are not supported by default.
+
 ## Quick Start
 
 Before installing:

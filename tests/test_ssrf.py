@@ -75,7 +75,7 @@ def _gai_mixed(public_ip, private_ip):
     "http://198.18.0.1/",
     "http://[::1]/",
     "http://[::ffff:127.0.0.1]/",     # IPv4-mapped IPv6 → normalized to v4 (D8)
-    "http://[64:ff9b::1]/",            # NAT64 explicit block
+    "http://[64:ff9b::1]/",            # NAT64 explicit block (Codex P2.5)
     "http://[fe80::1]/",               # IPv6 link-local
     "http://[fc00::1]/",               # IPv6 ULA
     "http://[::]/",                    # IPv6 unspecified
@@ -97,7 +97,7 @@ def test_71_blocked_ip_literals_raise_ssrf_blocked(url):
     "http://127.1/",           # short-form IPv4 → 127.0.0.1
 ])
 def test_71_ipv4_canonicalization_blocks_loopback_in_disguise(url):
-    """Validator must canonicalize IPv4 forms before blocklist."""
+    """Per Codex P2.5: validator must canonicalize IPv4 forms before blocklist."""
     with pytest.raises(ssrf.SSRFBlocked):
         ssrf.validate_outbound_url(url, allow_unconfigured=True)
 
@@ -130,7 +130,7 @@ def test_71_missing_host_raises():
     "http://[::g]/",                 # invalid v6 chars
 ])
 def test_71_malformed_bracketed_ipv6_rejected(url):
-    """urlparse / .hostname raise ValueError on malformed
+    """Codex P2.8: urlparse / .hostname raise ValueError on malformed
     bracketed IPv6 in Python 3.11+. Validator must convert to SSRFBlocked
     so callers see a single rejection type for unusable URLs."""
     with pytest.raises(ssrf.SSRFBlocked):
@@ -138,7 +138,7 @@ def test_71_malformed_bracketed_ipv6_rejected(url):
 
 
 def test_71_userinfo_url_rejected_before_dns(monkeypatch):
-    """Validator rejects user:pass@host before any DNS lookup,
+    """Codex P2.7: validator rejects user:pass@host before any DNS lookup,
     so credentials never enter canonical_url, logs, or exception messages."""
     fake = _gai_returning("93.184.216.34")
     monkeypatch.setattr(socket, "getaddrinfo", fake)
@@ -220,7 +220,7 @@ def test_72_idn_hostname_idna_encodes_then_resolves(monkeypatch):
 
 
 def test_72_unconfigured_hostname_does_not_dns_resolve(monkeypatch):
-    """Unconfigured hostnames must fail before getaddrinfo to
+    """Codex P2.6: unconfigured hostnames must fail before getaddrinfo to
     close the DNS-egress side channel. Even an attacker-supplied hostname
     must produce zero outbound DNS lookups."""
     fake = _gai_returning("93.184.216.34")
@@ -327,7 +327,7 @@ def test_73_is_configured_friend_short_circuits_unconfigured_check():
 
 
 def test_73_allow_private_with_hostname_rejected_before_dns(monkeypatch):
-    """Explicit per-friend `allow_private=True` is IP-literal-only
+    """Codex P2.4: explicit per-friend `allow_private=True` is IP-literal-only
     at the validator API. Hostname inputs must be rejected before any DNS
     lookup, regardless of whether the resolved address would be private."""
     fake = _gai_returning("10.0.0.5")
@@ -352,7 +352,7 @@ def test_73_unconfigured_check_runs_after_block_check():
         )
 
 
-# --- env gate matrix ---
+# --- env gate matrix (Codex P1.4) ---
 
 def test_73_env_set_no_dev_gate_rejects(monkeypatch):
     monkeypatch.setenv("A2A_ALLOW_PRIVATE_NETWORKS", "true")
@@ -397,6 +397,100 @@ def test_73_env_unset_dev_a2aenv_rejects(monkeypatch):
     with pytest.raises(ssrf.SSRFBlocked):
         ssrf.validate_outbound_url(
             "http://10.0.0.5/", allow_unconfigured=True
+        )
+
+
+def test_73_allowed_origin_normalizes_default_ports_and_strips_path():
+    assert ssrf.normalize_target_url("https://friend-a2a.example.com/path?q=1#frag") == (
+        "https://friend-a2a.example.com:443"
+    )
+    assert ssrf.normalize_target_url("http://demo.ngrok-free.app") == (
+        "http://demo.ngrok-free.app:80"
+    )
+
+
+def test_73_fake_ip_without_allowed_origin_has_clear_hint(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai_returning("198.18.0.139"))
+
+    with pytest.raises(ssrf.SSRFBlocked) as exc:
+        ssrf.validate_outbound_url(
+            "https://friend-a2a.example.com/",
+            allow_unconfigured=True,
+            is_configured_friend=True,
+            allow_env_private=False,
+            allow_origin_hint_name="demo_friend",
+        )
+
+    msg = str(exc.value)
+    assert "198.18.0.139" in msg
+    assert "TUN/fake-IP" in msg
+    assert "https://friend-a2a.example.com:443" in msg
+    assert "re-approval" in msg
+    assert '/a2a friends allow-origin demo_friend --reason "<your reason>"' in msg
+    assert "not private networks" in msg
+
+
+def test_73_allowed_origin_allows_custom_domain_fake_ip_for_configured_friend(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai_returning("198.18.0.139"))
+
+    target = ssrf.validate_outbound_url(
+        "https://friend-a2a.example.com/task",
+        allow_unconfigured=False,
+        is_configured_friend=True,
+        allow_env_private=False,
+        allowed_origins=[{"origin": "https://friend-a2a.example.com:443", "scope": ssrf.FAKE_IP_ALLOW_SCOPE}],
+    )
+
+    assert target.hostname == "friend-a2a.example.com"
+    assert target.pinned_ip == "198.18.0.139"
+
+
+def test_73_tunnel_approval_does_not_allow_rfc1918(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai_returning("10.0.0.5"))
+
+    with pytest.raises(ssrf.SSRFBlocked):
+        ssrf.validate_outbound_url(
+            "https://demo.trycloudflare.com/",
+            is_configured_friend=True,
+            allow_env_private=False,
+            allowed_origins=[{"origin": "https://demo.trycloudflare.com:443", "scope": ssrf.FAKE_IP_ALLOW_SCOPE}],
+        )
+
+
+def test_73_tunnel_approval_requires_exact_origin(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai_returning("198.18.0.139"))
+
+    with pytest.raises(ssrf.SSRFBlocked):
+        ssrf.validate_outbound_url(
+            "https://changed.trycloudflare.com/",
+            is_configured_friend=True,
+            allow_env_private=False,
+            allowed_origins=[{"origin": "https://demo.trycloudflare.com:443", "scope": ssrf.FAKE_IP_ALLOW_SCOPE}],
+        )
+
+
+def test_73_tunnel_approval_requires_configured_friend(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai_returning("198.18.0.139"))
+
+    with pytest.raises(ssrf.SSRFBlocked):
+        ssrf.validate_outbound_url(
+            "https://demo.trycloudflare.com/",
+            allow_unconfigured=True,
+            is_configured_friend=False,
+            allow_env_private=False,
+            allowed_origins=[{"origin": "https://demo.trycloudflare.com:443", "scope": ssrf.FAKE_IP_ALLOW_SCOPE}],
+        )
+
+
+def test_73_allowed_origin_requires_exact_port(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai_returning("198.18.0.139"))
+
+    with pytest.raises(ssrf.SSRFBlocked):
+        ssrf.validate_outbound_url(
+            "https://friend-a2a.example.com:8443/",
+            is_configured_friend=True,
+            allow_env_private=False,
+            allowed_origins=[{"origin": "https://friend-a2a.example.com:443", "scope": ssrf.FAKE_IP_ALLOW_SCOPE}],
         )
 
 
@@ -547,7 +641,7 @@ def test_74_no_second_getaddrinfo_after_validation(monkeypatch):
 
 
 def test_74_https_proxy_env_does_not_reroute(monkeypatch):
-    """ProxyHandler({}) must defeat env-var proxies.
+    """Codex P1.3: ProxyHandler({}) must defeat env-var proxies.
 
     With HTTPS_PROXY set, default urllib would dial proxy.example.com:8080.
     Our opener must still dial the target's pinned IP.
@@ -665,7 +759,7 @@ def test_76_opener_chain_includes_no_redirect_handler():
 
 
 # =====================================================================
-# §7.9 — canonical_url contract
+# §7.9 — canonical_url contract (Codex P2.7)
 #
 # P1.3 callsites MUST hand `target.canonical_url` to opener.open(); never
 # the raw input URL. Form: scheme://host[:port]/path[?query] — punycode
@@ -738,7 +832,7 @@ def test_79_canonical_url_ipv4_mapped_ipv6_normalized_to_v4():
 
 
 def test_79_canonical_url_percent_encodes_unicode_path(monkeypatch):
-    """Non-ASCII path must be percent-encoded so canonical_url
+    """Codex P2.9: non-ASCII path must be percent-encoded so canonical_url
     is safe to hand to http.client / opener.open."""
     monkeypatch.setattr(
         socket, "getaddrinfo", _gai_returning("93.184.216.34")

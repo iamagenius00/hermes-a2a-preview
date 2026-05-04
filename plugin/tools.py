@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
@@ -22,6 +23,7 @@ _RATE_LIMIT_WINDOW = 60
 _RATE_LIMIT_MAX_CALLS = 30
 _call_timestamps: deque[float] = deque()
 _rate_lock = threading.Lock()
+_last_config_validation_error = ""
 
 
 def _reason_is_substantive(reason: str) -> bool:
@@ -42,31 +44,124 @@ def _agent_private_allowed(agent: Dict[str, Any]) -> bool:
     return True
 
 
+def _agent_name_for_error(agent: Dict[str, Any]) -> str:
+    name = (agent or {}).get("name") or "<unnamed>"
+    return str(name)
+
+
+def _config_agent_prefix(index: int, agent: Dict[str, Any]) -> str:
+    return f"config a2a.agents[{index}] ({_agent_name_for_error(agent)})"
+
+
+def _normalize_config_origin(value: str, *, expected: str, field: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError(f'{field} is required. Expected: "{expected}"')
+    try:
+        parsed = urlparse(raw)
+    except ValueError as exc:
+        raise ValueError(f'{field} is not a valid origin: {exc}') from exc
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError(
+            f'{field} must be an origin only: scheme + host + optional port, no path/query/fragment. '
+            f'Expected: "{expected}"'
+        )
+    try:
+        return ssrf.normalize_target_url(raw)
+    except ssrf.SSRFBlocked as exc:
+        raise ValueError(f'{field} is not a valid origin: {exc}') from exc
+
+
+def _agent_allowed_origins(agent: Dict[str, Any], index: int = 0) -> list[dict]:
+    url = _validate_target_url(agent.get("url", ""))
+    url_origin = ssrf.normalize_target_url(url)
+    entries: list[dict] = []
+    raw_entries = agent.get("allowed_origins") or []
+    if raw_entries and not isinstance(raw_entries, list):
+        raise ValueError(f"{_config_agent_prefix(index, agent)} allowed_origins must be a list")
+    for entry_index, entry in enumerate(raw_entries):
+        field = f"{_config_agent_prefix(index, agent)} allowed_origins[{entry_index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{field} must be an object")
+        origin = _normalize_config_origin(
+            str(entry.get("origin", "")),
+            expected=url_origin,
+            field=f"{field}.origin",
+        )
+        scope = (entry.get("scope") or ssrf.FAKE_IP_ALLOW_SCOPE).strip()
+        if scope != ssrf.FAKE_IP_ALLOW_SCOPE:
+            raise ValueError(
+                f'{field}.scope "{scope}" is not supported. Expected: "{ssrf.FAKE_IP_ALLOW_SCOPE}"'
+            )
+        if origin != url_origin:
+            raise ValueError(
+                f'{field}.origin "{entry.get("origin", "")}" does not match agent url origin. '
+                f'Expected: "{url_origin}" (port normalized) Got: "{origin}"'
+            )
+        if not _not_expired(entry.get("expires_at")):
+            continue
+        if not _reason_is_substantive(entry.get("reason", "")):
+            raise ValueError(f"{field}.reason requires a reason of at least 20 characters")
+        entries.append({
+            "origin": origin,
+            "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+            "expires_at": entry.get("expires_at"),
+            "provider": entry.get("provider") or ssrf.tunnel_provider_for_url(url) or "custom",
+        })
+
+    legacy_origin = (agent.get("approved_tunnel_origin") or "").strip()
+    if legacy_origin:
+        if legacy_origin != url_origin:
+            raise ValueError("config a2a.agents approved_tunnel_origin must match url origin")
+        if _not_expired(agent.get("approved_tunnel_expires_at")):
+            if not _reason_is_substantive(agent.get("approved_tunnel_reason", "")):
+                raise ValueError("config a2a.agents approved_tunnel_reason requires a reason of at least 20 characters")
+            entries.append({
+                "origin": legacy_origin,
+                "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+                "expires_at": agent.get("approved_tunnel_expires_at"),
+                "provider": ssrf.tunnel_provider_for_url(url) or "custom",
+            })
+    return entries
+
+
 def _validate_configured_agents(agents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    for agent in agents:
+    for index, agent in enumerate(agents):
         if not isinstance(agent, dict):
-            raise ValueError("config a2a.agents entries must be objects")
+            raise ValueError(f"config a2a.agents[{index}] must be an object")
         url = agent.get("url", "")
         if not url:
             continue
-        _validate_target_url(url)
-        _agent_private_allowed(agent)
+        try:
+            _validate_target_url(url)
+            _agent_private_allowed(agent)
+            _agent_allowed_origins(agent, index)
+        except ValueError as exc:
+            if str(exc).startswith("config a2a.agents["):
+                raise
+            raise ValueError(f"{_config_agent_prefix(index, agent)} invalid: {exc}") from exc
     return agents
 
 
 def _load_configured_agents() -> List[Dict[str, Any]]:
+    global _last_config_validation_error
     try:
         from hermes_cli.config import load_config
     except Exception:
+        _last_config_validation_error = ""
         return []
     try:
         agents = load_config().get("a2a", {}).get("agents", [])
     except Exception:
+        _last_config_validation_error = ""
         return []
     try:
-        return _validate_configured_agents(agents)
+        validated = _validate_configured_agents(agents)
+        _last_config_validation_error = ""
+        return validated
     except (ValueError, ssrf.SSRFBlocked, ssrf.DNSResolutionFailed, ssrf.UnconfiguredURL, ssrf.RedirectBlocked) as e:
-        logger.error("a2a.agents config invalid at runtime, dropping agents: %s", e)
+        _last_config_validation_error = f"a2a.agents config invalid at runtime: {e}"
+        logger.error("%s", _last_config_validation_error)
         return []
 
 
@@ -104,11 +199,73 @@ def _friend_private_allowed(friend: dict) -> bool:
     )
 
 
+def _not_expired(expires_at: Any) -> bool:
+    if not expires_at:
+        return True
+    if not isinstance(expires_at, str):
+        return False
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires > datetime.now(timezone.utc)
+
+
+def _friend_allowed_origins(friend: dict, url: str) -> list[dict]:
+    entries = []
+    current_url = _validate_target_url(url or (friend or {}).get("url", ""))
+    current_origin = ssrf.normalize_target_url(current_url)
+    for entry in (friend or {}).get("allowed_origins") or []:
+        if not isinstance(entry, dict):
+            continue
+        origin = (entry.get("origin") or "").strip()
+        scope = (entry.get("scope") or ssrf.FAKE_IP_ALLOW_SCOPE).strip()
+        if origin == current_origin and scope == ssrf.FAKE_IP_ALLOW_SCOPE and _not_expired(entry.get("expires_at")):
+            entries.append({
+                "origin": origin,
+                "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+                "expires_at": entry.get("expires_at"),
+                "provider": entry.get("provider") or ssrf.tunnel_provider_for_url(current_url) or "custom",
+            })
+    legacy_origin = (friend or {}).get("approved_tunnel_origin", "")
+    if (
+        legacy_origin
+        and legacy_origin == current_origin
+        and _not_expired((friend or {}).get("approved_tunnel_expires_at"))
+    ):
+        entries.append({
+            "origin": legacy_origin,
+            "scope": ssrf.FAKE_IP_ALLOW_SCOPE,
+            "expires_at": (friend or {}).get("approved_tunnel_expires_at"),
+            "provider": (friend or {}).get("approved_tunnel_provider") or ssrf.tunnel_provider_for_url(current_url) or "custom",
+        })
+    return entries
+
+
+def _policy_allowed_origins(policy_record: dict | None, url: str) -> list[dict]:
+    if not policy_record:
+        return []
+    if policy_record.get("_source") == "config.yaml":
+        try:
+            return _agent_allowed_origins(policy_record)
+        except ValueError:
+            logger.warning("Configured A2A allowed origin is invalid for %r", policy_record.get("name", "configured"))
+            return []
+    return _friend_allowed_origins(policy_record, url)
+
+
 def _config_agent_policy_record(agent: Dict[str, Any]) -> dict:
     name = agent.get("name", "configured")
     return {
         "id": f"f_configyaml_{name}",
         "name": name,
+        "url": agent.get("url", ""),
+        "allowed_origins": agent.get("allowed_origins", []),
+        "approved_tunnel_origin": agent.get("approved_tunnel_origin", ""),
+        "approved_tunnel_reason": agent.get("approved_tunnel_reason", ""),
+        "approved_tunnel_expires_at": agent.get("approved_tunnel_expires_at"),
         "status": "active",
         "trust_level": "normal",
         "_synthetic": True,
@@ -156,7 +313,7 @@ def _resolve_target(name: str, url: str) -> tuple[str, str, bool, bool, bool, di
                 True,
                 False,
                 friend,
-            )
+                )
         for agent in agents:
             if agent.get("name", "").lower() == name.lower():
                 return (
@@ -167,6 +324,8 @@ def _resolve_target(name: str, url: str) -> tuple[str, str, bool, bool, bool, di
                     False,
                     _config_agent_policy_record(agent),
                 )
+        if _last_config_validation_error:
+            raise ValueError(_last_config_validation_error)
         raise ValueError(f"Agent '{name}' not found in config")
 
     url = _validate_target_url(url)
@@ -190,6 +349,8 @@ def _resolve_target(name: str, url: str) -> tuple[str, str, bool, bool, bool, di
             policy_record = _config_agent_policy_record(agent)
             break
     if not is_configured_friend:
+        if _last_config_validation_error:
+            raise ValueError(_last_config_validation_error)
         if os.getenv("A2A_ALLOW_UNCONFIGURED_URLS", "").lower() not in ("1", "true", "yes"):
             raise ValueError(
                 "Direct A2A URL is not configured; use a configured agent name "
@@ -204,8 +365,11 @@ def _ok(data: dict) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _err(msg: str) -> str:
-    return json.dumps({"error": msg}, ensure_ascii=False)
+def _err(msg: str, data: dict | None = None) -> str:
+    payload = {"error": msg}
+    if data:
+        payload["data"] = data
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _controlled_resolve_error(exc: Exception) -> str:
@@ -224,6 +388,51 @@ def _controlled_resolve_error(exc: Exception) -> str:
     return str(exc)
 
 
+def _controlled_error_data(exc: Exception) -> dict:
+    candidate = exc
+    if isinstance(exc, PermissionError) and isinstance(exc.__cause__, ssrf.SSRFBlocked):
+        candidate = exc.__cause__
+    if isinstance(candidate, ssrf.SSRFBlocked):
+        recovery = getattr(candidate, "recovery", None)
+        if isinstance(recovery, dict):
+            return recovery
+    return {}
+
+
+def _controlled_error_payload(exc: Exception) -> tuple[str, dict]:
+    return _controlled_resolve_error(exc), _controlled_error_data(exc)
+
+
+def _audit_target(url: str, policy_record: dict | None = None) -> dict:
+    try:
+        origin = ssrf.normalize_target_url(url)
+    except Exception:
+        origin = ""
+    data = {
+        "target_origin": origin or "invalid",
+        "friend_name": (policy_record or {}).get("name", ""),
+        "friend_id": (policy_record or {}).get("id", ""),
+    }
+    allowed = _policy_allowed_origins(policy_record, url)
+    match = next((entry for entry in allowed if entry.get("origin") == origin), None)
+    if match:
+        data["origin_scope"] = match.get("scope", ssrf.FAKE_IP_ALLOW_SCOPE)
+        data["origin_provider"] = match.get("provider") or ssrf.tunnel_provider_for_url(url) or "custom"
+    return data
+
+
+def _persistence_agent_label(name: str, url: str, policy_record: dict | None = None) -> str:
+    policy_name = (policy_record or {}).get("name", "")
+    if policy_name:
+        return policy_name
+    if name:
+        return name
+    try:
+        return ssrf.normalize_target_url(url)
+    except Exception:
+        return "remote"
+
+
 def _http_request(
     method: str,
     url: str,
@@ -233,6 +442,9 @@ def _http_request(
     allow_private: bool = False,
     allow_unconfigured: bool = False,
     is_configured_friend: bool = False,
+    approved_tunnel_origin: str = "",
+    allowed_origins=None,
+    allow_origin_hint_name: str = "",
 ) -> dict:
     """Synchronous HTTP request using urllib (no async dependency)."""
     import urllib.request
@@ -251,6 +463,9 @@ def _http_request(
             allow_unconfigured=allow_unconfigured,
             is_configured_friend=is_configured_friend,
             allow_env_private=allow_unconfigured,
+            approved_tunnel_origin=approved_tunnel_origin,
+            allowed_origins=allowed_origins,
+            allow_origin_hint_name=allow_origin_hint_name,
         )
         req = urllib.request.Request(target.canonical_url, data=data, headers=req_headers, method=method)
         opener = ssrf.build_ssrf_opener(target)
@@ -285,9 +500,10 @@ def handle_discover(args: dict, **kwargs) -> str:
         return _err("Provide either 'url' or 'name'")
 
     try:
-        url, auth_token, allow_private, is_configured_friend, allow_unconfigured, _policy_record = _resolve_target(name, url)
+        url, auth_token, allow_private, is_configured_friend, allow_unconfigured, policy_record = _resolve_target(name, url)
     except (ValueError, ssrf.SSRFBlocked, ssrf.DNSResolutionFailed, ssrf.UnconfiguredURL, ssrf.RedirectBlocked) as e:
-        return _err(_controlled_resolve_error(e))
+        msg, data = _controlled_error_payload(e)
+        return _err(msg, data)
 
     headers = {}
     if auth_token:
@@ -301,13 +517,16 @@ def handle_discover(args: dict, **kwargs) -> str:
             allow_private=allow_private,
             allow_unconfigured=allow_unconfigured,
             is_configured_friend=is_configured_friend,
+            allowed_origins=_policy_allowed_origins(policy_record, url),
+            allow_origin_hint_name=(policy_record or {}).get("name", ""),
         )
     except (PermissionError, ConnectionError) as e:
-        return _err(_controlled_resolve_error(e))
+        msg, data = _controlled_error_payload(e)
+        return _err(msg, data)
     except Exception as e:
         return _err(f"Discovery failed: {e}")
 
-    audit.log("discover", {"url": url, "agent_name": card.get("name", "unknown")})
+    audit.log("discover", {**_audit_target(url, policy_record), "agent_name": card.get("name", "unknown")})
 
     return _ok({
         "agent_name": card.get("name", "unknown"),
@@ -467,7 +686,8 @@ def handle_call(args: dict, **kwargs) -> str:
     try:
         url, auth_token, allow_private, is_configured_friend, allow_unconfigured, policy_record = _resolve_target(name, url)
     except (ValueError, ssrf.SSRFBlocked, ssrf.DNSResolutionFailed, ssrf.UnconfiguredURL, ssrf.RedirectBlocked) as e:
-        return _err(_controlled_resolve_error(e))
+        msg, data = _controlled_error_payload(e)
+        return _err(msg, data)
 
     # Issue 7a: friend-status + content + hop-count gating
     friend_record = policy_record if policy_record is not None else _friend_for_outbound(name)
@@ -482,7 +702,7 @@ def handle_call(args: dict, **kwargs) -> str:
     )
     if not decision.allow:
         audit.log("outbound_denied", {
-            "target": url,
+            **_audit_target(url, friend_record),
             "friend_name": (friend_record or {}).get("name", ""),
             "friend_id": (friend_record or {}).get("id", ""),
             "reason": decision.reason,
@@ -521,7 +741,7 @@ def handle_call(args: dict, **kwargs) -> str:
         headers["Authorization"] = f"Bearer {auth_token}"
 
     audit.log("call_outbound", {
-        "target": url,
+        **_audit_target(url, friend_record),
         "task_id": task_id,
         "length": len(message),
         "provenance": decision.provenance,
@@ -530,7 +750,7 @@ def handle_call(args: dict, **kwargs) -> str:
     # Persist outbound message immediately so it's visible even before reply arrives
     try:
         from .persistence import save_exchange
-        agent_label = name or url.rstrip("/").rsplit("/", 1)[-1]
+        agent_label = _persistence_agent_label(name, url, friend_record)
         save_exchange(
             agent_name=agent_label,
             task_id=task_id,
@@ -545,6 +765,7 @@ def handle_call(args: dict, **kwargs) -> str:
     response_text = ""
     task_state = "unknown"
     error_msg = ""
+    error_data = {}
 
     try:
         result = _http_request(
@@ -555,9 +776,11 @@ def handle_call(args: dict, **kwargs) -> str:
             allow_private=allow_private,
             allow_unconfigured=allow_unconfigured,
             is_configured_friend=is_configured_friend,
+            allowed_origins=_policy_allowed_origins(policy_record, url),
+            allow_origin_hint_name=(policy_record or {}).get("name", ""),
         )
     except (PermissionError, ConnectionError) as e:
-        error_msg = _controlled_resolve_error(e)
+        error_msg, error_data = _controlled_error_payload(e)
     except TimeoutError:
         error_msg = f"Remote agent timed out after {_DEFAULT_TIMEOUT}s"
     except Exception as e:
@@ -591,6 +814,8 @@ def handle_call(args: dict, **kwargs) -> str:
                             allow_private=allow_private,
                             allow_unconfigured=allow_unconfigured,
                             is_configured_friend=is_configured_friend,
+                            allowed_origins=_policy_allowed_origins(policy_record, url),
+                            allow_origin_hint_name=(policy_record or {}).get("name", ""),
                         )
                         poll_inner = poll_result.get("result", {})
                         poll_state = poll_inner.get("status", {}).get("state", "")
@@ -607,12 +832,17 @@ def handle_call(args: dict, **kwargs) -> str:
                         response_text += part.get("text", "") + "\n"
             response_text = sanitize_inbound(response_text.strip())
 
-    audit.log("call_inbound", {"source": url, "task_state": task_state, "task_id": task_id, "error": error_msg or None})
+    audit.log("call_inbound", {
+        **_audit_target(url, friend_record),
+        "task_state": task_state,
+        "task_id": task_id,
+        "error": error_msg or None,
+    })
 
     # Update the initial "waiting" entry with actual response
     try:
         from .persistence import update_exchange
-        agent_label = name or url.rstrip("/").rsplit("/", 1)[-1]
+        agent_label = _persistence_agent_label(name, url, friend_record)
         inbound = response_text or (f"(error: {error_msg})" if error_msg else "(no text response)")
         update_exchange(
             agent_name=agent_label,
@@ -623,7 +853,7 @@ def handle_call(args: dict, **kwargs) -> str:
         logger.debug("Failed to update outbound exchange: %s", exc)
 
     if error_msg:
-        return _err(error_msg)
+        return _err(error_msg, error_data)
 
     return _ok({
         "task_id": rpc_result.get("id", task_id),
@@ -639,6 +869,8 @@ def handle_list(args: dict, **kwargs) -> str:
         agents = _load_configured_agents()
     except (ValueError, ssrf.SSRFBlocked, ssrf.DNSResolutionFailed, ssrf.UnconfiguredURL, ssrf.RedirectBlocked) as e:
         return _err(_controlled_resolve_error(e))
+    if _last_config_validation_error:
+        return _err(_last_config_validation_error)
     if not agents:
         return _ok({
             "agents": [],

@@ -176,6 +176,71 @@ M2 仍然是保守预览：
 - streaming/SSE、hosted registry、relay/mailbox fallback 和 mobile approval
   flows 暂时不包含。
 
+### Fake-IP / tunnel origin approval
+
+M2.1 的核心兼容路径是朋友 agent 直连：朋友把本地 agent 通过 cloudflared
+或 ngrok 这样的临时 tunnel 暴露出来，然后你的 Hermes A2A 把这个 tunnel URL
+当作已配置 friend 来调用。
+
+如果是让朋友连到你的 agent，先暴露本地 A2A 端口，然后把 tunnel URL 和
+`/a2a friends add` 返回的一次性 inbound token 通过 A2A 之外的渠道发给对方：
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8081
+```
+
+如果是你要调用朋友的 tunneled agent，就把朋友给你的 URL 写到这个 friend 的
+A2A URL。这个 URL 可以是 `*.trycloudflare.com`、`*.ngrok-free.app`、
+`*.ngrok.app`，也可以是 `friend-a2a.example.com` 这样的自定义域名。
+
+某些本地代理/TUN 设置会把 friend hostname 解析成 `198.18.x.x` fake-IP。
+Hermes 默认会阻断，因为 `198.18.0.0/15` 是非公网 benchmark 地址段。如果这是
+有意使用的朋友 origin，需要显式批准 exact origin：
+
+```text
+/a2a friends add demo_friend https://friend-a2a.example.com --allow-origin --reason "I trust this exact demo friend origin for local fake-IP testing"
+```
+
+已有 friend 可以这样批准或撤销：
+
+```text
+/a2a friends set-url demo_friend https://friend-a2a.example.com
+/a2a friends allow-origin demo_friend --reason "I trust this exact demo friend origin for local fake-IP testing"
+/a2a friends list-origins demo_friend
+/a2a friends revoke-origin demo_friend
+```
+
+批准后，重新对这个 friend 跑 `a2a_discover` 或 `a2a_call`。如果 origin 变了，
+调用会再次被拒，需要重新批准。
+
+如果 agent 仍由 config.yaml 管理，同样要显式写 approval：
+
+```yaml
+a2a:
+  agents:
+    - name: demo_friend
+      url: https://friend-a2a.example.com
+      allowed_origins:
+        - origin: https://friend-a2a.example.com
+          reason: "I trust this exact demo friend origin for local fake-IP testing"
+```
+
+Fake-IP origin approval 刻意保持很窄：
+
+- 只绑定 exact normalized origin：scheme + host + 显式端口（`https` 默认
+  `:443`，`http` 默认 `:80`）。config.yaml 里可以写
+  `origin: https://friend-a2a.example.com`，运行时会内部规范化。
+- M2.1 的 config `scope` 可以省略，默认是 `fake_ip_198_18`。
+- Quick Tunnel URL 和自定义域名 target 都可能变化。origin 变了必须重新 approve。
+- M2.1 没有 wildcard approval。
+- approval 只覆盖已配置 friend/config target 的 `198.18.0.0/15` fake-IP
+  解析结果。它不放行 RFC1918、loopback、link-local、metadata IP、IPv6
+  private range，也不放行任意 direct URL fetch。
+- 这不是 private-network approval。显式本地开发目标仍走 IP-literal
+  `--allow-private-url --reason ...` 流程。
+- redirect 不会被跟随。
+- tailnet / `ts.net` private-network target 默认不支持。
+
 ## Quick Start
 
 安装前：
